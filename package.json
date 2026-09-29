@@ -1,0 +1,17 @@
+{
+  "name": "omgyeo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "기종 상관없이 폰·PC 사이에서 파일과 글을 주고받는 웹앱",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "ws": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
