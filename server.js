@@ -93,7 +93,8 @@ function newCode() {
   }
   return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 }
-const info = ws => ({ id: ws.id, name: ws.name, kind: ws.kind });
+// pub: 종단간 암호화용 공개키(서버는 전달만 함), dev: 페이지가 살아 있는 동안 유지되는 기기 식별자(이어받기용)
+const info = ws => ({ id: ws.id, name: ws.name, kind: ws.kind, pub: ws.pub, dev: ws.dev });
 const sendJSON = (ws, obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
 
 function join(ws, roomId) {
@@ -133,6 +134,8 @@ wss.on('connection', ws => {
   ws.name = '기기';
   ws.kind = 'pc';
   ws.room = null;
+  ws.pub = null;
+  ws.dev = ws.id;
   ws.alive = true;
   ws.on('pong', () => { ws.alive = true; });
   sendJSON(ws, { type: 'welcome', id: ws.id });
@@ -154,6 +157,8 @@ wss.on('connection', ws => {
       case 'hello':
         ws.name = String(m.name || '기기').slice(0, 30);
         ws.kind = ['pc', 'phone', 'tablet'].includes(m.kind) ? m.kind : 'pc';
+        ws.pub = typeof m.pub === 'string' && m.pub.length <= 200 ? m.pub : null;
+        ws.dev = typeof m.dev === 'string' && /^[a-z0-9]{8,32}$/.test(m.dev) ? m.dev : ws.id;
         break;
       case 'create':
         join(ws, randomId(10));
