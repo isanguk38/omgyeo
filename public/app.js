@@ -105,6 +105,8 @@ const DEV = detectDevice();
 const IS_MOBILE = DEV.kind !== 'pc';
 const SESSION_DEV = randStr(16);   // 이 페이지가 살아 있는 동안 같은 기기로 알아보는 표식 (서버 재접속해도 유지)
 let myName = store.get('omgyeo.name', DEV.label);
+// 이 브라우저를 계속 같은 PC로 알아보는 표식 (폴더 동기화 짝 기억용)
+const PERSIST_ID = store.get('omgyeo.pid', null) || (() => { const v = randStr(16); store.set('omgyeo.pid', v); return v; })();
 
 // ---------- 상태 ----------
 const S = {
@@ -170,7 +172,7 @@ function connect() {
   S.ws = ws;
   ws.onopen = () => {
     setNet(true);
-    sendServer({ type: 'hello', name: myName, kind: DEV.kind, pub: myPub, dev: SESSION_DEV });
+    sendServer({ type: 'hello', name: myName, kind: DEV.kind, pub: myPub, dev: SESSION_DEV, caps: { fs: FS_OK, pid: PERSIST_ID } });
     if (S.want === 'create') sendServer({ type: 'create' });
     else if (S.want) sendServer({ type: 'join', ...S.want });
   };
@@ -255,7 +257,9 @@ function addPeer(info, initiator) {
     key: null, safety: null, waiters: new Map(), recvChain: Promise.resolve(), sendChain: Promise.resolve(),
   };
   S.peers.set(p.id, p);
+  p.caps = info.caps || {};
   p.keyP = deriveKey(p);
+  setTimeout(() => { if (alive(p) && typeof Sync !== 'undefined') Sync.onPeerJoined(p); }, 0);
 
   // 끊겼다 돌아온 기기면 멈춘 전송을 이어서
   const back = S.parked.filter(j => j.dev === p.dev);
@@ -314,6 +318,7 @@ async function onSignal(from, d) {
 }
 function closePeer(p) {
   clearTimeout(p.timer);
+  if (typeof Sync !== 'undefined') Sync.onPeerLeft(p);
   rejectAll(p);
   try { p.dc && p.dc.close(); } catch {}
   try { p.pc && p.pc.close(); } catch {}
@@ -394,6 +399,7 @@ async function handleFrame(p, u8) {
   }
 }
 function onCtrl(p, m) {
+  if (typeof m.t === 'string' && m.t.startsWith('sync-')) return typeof Sync !== 'undefined' ? Sync.onCtrl(p, m) : undefined;
   switch (m.t) {
     case 'file': return onFileOffer(p, m);
     case 'resume': return settle(p, `resume:${m.uid}`, m.from);
@@ -406,6 +412,7 @@ function onCtrl(p, m) {
     case 'text':
       addFeed({ kind: 'text', dir: 'in', text: String(m.text), peerName: p.name, time: Date.now() });
       toast(`${p.name}에서 글이 왔어요`);
+      announce(`${p.name}에서 글이 왔어요`, String(m.text).slice(0, 120));
       return;
   }
 }
@@ -526,11 +533,41 @@ function sendText(text) {
 }
 
 // ---------- 받기 ----------
-function onFileOffer(p, m) {
+// 받는 폴더를 지정해 두었으면(PC 크롬·엣지) 메모리에 모으지 않고 디스크에 바로 씀
+async function openDiskWriter(inc) {
+  if (!S.dl || !S.dl.ok) return false;
+  try {
+    let fh;
+    if (inc.bundle) {
+      const b = inc.bundle;
+      if (!b.diskDir) {   // 같은 이름 폴더가 있으면 "이름 (1)"
+        let name = b.name;
+        for (let i = 1; i < 1000; i++) {
+          try { await S.dl.handle.getDirectoryHandle(name); name = `${b.name} (${i})`; } catch { break; }
+        }
+        b.diskDir = await S.dl.handle.getDirectoryHandle(name, { create: true });
+        b.diskName = name;
+      }
+      const rel = (inc.path || inc.name).split('/').slice(1).join('/') || inc.name;
+      fh = await fileHandleAt(b.diskDir, rel, true);
+    } else fh = await uniqueFileHandle(S.dl.handle, inc.name);
+    inc.fh = fh;
+    inc.writer = await fh.createWritable();
+    inc.onDisk = true;
+    inc.wantCrc = false;
+    inc.parts = null;
+    return true;
+  } catch (err) {
+    console.warn('disk', err);
+    toast('받는 폴더에 쓰지 못해서 브라우저 메모리로 받아요.');
+    return false;
+  }
+}
+async function onFileOffer(p, m) {
   let inc = S.partials.get(m.uid);
   if (inc && inc.state === 'done') { sendCtrl(p, { t: 'resume', uid: m.uid, from: -1 }).catch(() => {}); return; }
   if (inc) for (const [k, v] of S.fidMap) if (v === inc) S.fidMap.delete(k);   // 끊기기 전 조각은 무시
-  if (inc && inc.parts && inc.size === m.size) {
+  if (inc && (inc.parts || inc.writer) && inc.size === m.size && inc.state !== 'cancelled') {
     inc.state = 'receiving'; inc.peerId = p.id; inc.peerName = p.name;
     inc.start = performance.now(); inc.startDone = inc.done;
     if (inc.done > 0) { inc.resumed = true; toast(`${inc.name} ${Math.floor((inc.done / inc.size) * 100)}%부터 이어받아요`); }
@@ -552,26 +589,54 @@ function onFileOffer(p, m) {
       inc.bundle = b;
       b.files.push(inc);
     } else addFeed(inc);
+    await openDiskWriter(inc);
   }
   S.fidMap.set(`${p.id}:${m.fid}`, inc);
   sendCtrl(p, { t: 'resume', uid: m.uid, from: inc.done }).catch(() => {});
-  if (inc.size === 0) finishIncoming(p, inc);
+  if (inc.size === 0) await finishIncoming(p, inc);
   keepAwake(); scheduleFeed();
 }
-function onChunk(p, fid, data) {
-  const inc = S.fidMap.get(`${p.id}:${fid}`);
-  if (!inc || !inc.parts || inc.state !== 'receiving') return;
-  inc.parts.push(data);
+async function onChunk(p, fid, data) {
+  const key = `${p.id}:${fid}`;
+  if (typeof Sync !== 'undefined' && Sync.fidMap.has(key)) return Sync.onChunk(p, fid, data);
+  const inc = S.fidMap.get(key);
+  if (!inc || inc.state !== 'receiving') return;
+  if (inc.writer) {
+    try { await inc.writer.write(data); } catch (err) {
+      console.warn('disk write', err);
+      inc.state = 'failed'; inc.writer.abort().catch(() => {}); inc.writer = null;
+      S.partials.delete(inc.uid);
+      sendCtrl(p, { t: 'cancel', uid: inc.uid }).catch(() => {});
+      toast(`${inc.name}을(를) 디스크에 쓰지 못했어요. 남은 공간을 확인하세요.`);
+      return scheduleFeed();
+    }
+  } else if (inc.parts) {
+    inc.parts.push(data);
+    inc.pendingBytes += data.length;
+    if (inc.pendingBytes >= MERGE_AT) { inc.parts = [new Blob(inc.parts)]; inc.pendingBytes = 0; }
+  } else return;
   inc.done += data.length;
-  inc.pendingBytes += data.length;
   if (inc.wantCrc) inc.crc = crc32(inc.crc, data);
-  if (inc.pendingBytes >= MERGE_AT) { inc.parts = [new Blob(inc.parts)]; inc.pendingBytes = 0; }
-  if (inc.done >= inc.size) finishIncoming(p, inc);
-  else scheduleFeed();
+  if (inc.done >= inc.size) return finishIncoming(p, inc);
+  scheduleFeed();
 }
-function finishIncoming(p, inc) {
-  inc.blob = new Blob(inc.parts, { type: inc.mime });
-  inc.parts = null;
+async function finishIncoming(p, inc) {
+  if (inc.writer) {
+    try {
+      await inc.writer.close();
+      inc.blob = await inc.fh.getFile();   // 디스크에 있는 파일을 가리킴 (메모리에 올리지 않음)
+      inc.saved = true;
+    } catch (err) {
+      console.warn('disk close', err);
+      inc.state = 'failed'; inc.writer = null; S.partials.delete(inc.uid);
+      toast(`${inc.name}을(를) 저장하지 못했어요.`);
+      return scheduleFeed();
+    }
+    inc.writer = null;
+  } else {
+    inc.blob = new Blob(inc.parts, { type: inc.mime });
+    inc.parts = null;
+  }
   inc.state = 'done';
   inc.url = URL.createObjectURL(inc.blob);
   if (!inc.bundle && inc.mime.startsWith('image/')) inc.thumb = inc.url;
@@ -579,8 +644,14 @@ function finishIncoming(p, inc) {
   sendCtrl(p, { t: 'ack', uid: inc.uid }).catch(() => {});
   if (inc.bundle) {
     const b = inc.bundle;
-    if (b.files.length === b.count && b.files.every(f => f.state === 'done')) toast(`${b.name} 폴더 받음 (파일 ${b.count}개)`);
-  } else toast(`${inc.name} 받음`);
+    if (b.files.length === b.count && b.files.every(f => f.state === 'done')) {
+      toast(`${b.name} 폴더 받음 (파일 ${b.count}개)`);
+      announce(`${p.name}에서 폴더를 보냈어요`, `${b.name} · 파일 ${b.count}개`);
+    }
+  } else {
+    toast(inc.onDisk ? `${inc.name} 받아서 저장함` : `${inc.name} 받음`);
+    announce(`${p.name}에서 파일을 보냈어요`, `${inc.name} · ${fmtSize(inc.size)}`);
+  }
   scheduleFeed();
   keepAwake();
 }
@@ -851,6 +922,7 @@ function updateItem(it) {
   else if (it.thumb && it.shown.thumb !== it.thumb) { r.th.innerHTML = `<img alt="" src="${it.thumb}">`; it.shown.thumb = it.thumb; }
   else if (!it.thumb && !it.shown.thumb) { r.th.textContent = extOf(it.name); it.shown.thumb = '-'; }
 
+  r.th.classList.toggle('zoom', isMedia(it));
   const pct = it.size ? Math.min(100, (it.done / it.size) * 100) : (it.state === 'done' ? 100 : 0);
   r.fill.style.width = `${pct}%`;
   let sz = it.kind === 'bundle' ? `파일 ${it.count}개 · ${fmtSize(it.size)}` : fmtSize(it.size);
@@ -880,7 +952,9 @@ function updateItem(it) {
   };
   if (it.state === 'done') {
     if (it.dir === 'out') r.act.innerHTML = '<span class="st done">전달 완료</span>';
-    else if (it.kind === 'bundle') {
+    else if (it.kind === 'bundle' && it.files.every(f => f.onDisk)) {
+      r.act.innerHTML = `<span class="st done">'${esc(it.diskName || it.name)}' 폴더에 저장됨</span>`;
+    } else if (it.kind === 'bundle') {
       const zipOk = it.size < ZIP_LIMIT && it.count < 65535;
       r.act.innerHTML = (zipOk ? `<button type="button" class="${it.saved ? '' : 'solid'}" data-a="zip">${it.saved ? 'zip 다시 저장' : 'zip으로 저장'}</button>` : '') +
         `<button type="button" class="${zipOk ? '' : 'solid'}" data-a="each">파일 각각 저장</button>`;
@@ -912,6 +986,7 @@ function cancelItem(it) {
     j.state = 'cancelled';
     if (j.dir === 'in') {
       j.parts = null; S.partials.delete(j.uid);
+      if (j.writer) { j.writer.abort().catch(() => {}); j.writer = null; }
       const p = S.peers.get(j.peerId);
       if (p) sendCtrl(p, { t: 'cancel', uid: j.uid }).catch(() => {});
     }
@@ -920,6 +995,8 @@ function cancelItem(it) {
   scheduleFeed();
 }
 $('#feed').addEventListener('click', async e => {
+  const th = e.target.closest('.th.zoom');
+  if (th) { const it = S.feed.find(x => x.el === th.closest('li')); if (it) return openViewer(it); }
   const b = e.target.closest('[data-a]');
   if (!b) return;
   const it = S.feed.find(x => x.el === b.closest('li'));
@@ -1017,6 +1094,131 @@ async function keepAwake() {
 }
 addEventListener('beforeunload', e => { if (busy()) { e.preventDefault(); e.returnValue = ''; } });
 
+// ---------- 받으면 알림 (다른 창을 보고 있을 때) ----------
+const NOTIFY = { on: store.get('omgyeo.notify', false), unseen: 0 };
+async function announce(title, body) {
+  if (!document.hidden) return;
+  NOTIFY.unseen++;
+  document.title = `(${NOTIFY.unseen}) 옮겨`;
+  if (!NOTIFY.on || !('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    // 안드로이드 크롬은 페이지에서 바로 알림을 못 띄워서 서비스 워커를 통해 띄움
+    const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
+    if (reg) await reg.showNotification(title, { body, tag: 'omgyeo', renotify: true });
+    else new Notification(title, { body, tag: 'omgyeo' });
+  } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { NOTIFY.unseen = 0; document.title = '옮겨'; }
+});
+function renderBell() {
+  const on = NOTIFY.on && 'Notification' in window && Notification.permission === 'granted';
+  $('#bellBtn').setAttribute('aria-pressed', String(on));
+  $('#bellBtn').title = on ? '알림 켜짐 · 누르면 끔' : '받으면 알림 받기';
+}
+$('#bellBtn').onclick = async () => {
+  if (!('Notification' in window)) return toast('이 브라우저는 알림을 지원하지 않아요. 아이폰은 홈 화면에 추가한 뒤에만 돼요.');
+  if (NOTIFY.on) { NOTIFY.on = false; store.set('omgyeo.notify', false); renderBell(); return toast('알림을 껐어요'); }
+  let perm = Notification.permission;
+  if (perm === 'default') perm = await Notification.requestPermission();
+  if (perm !== 'granted') return toast('브라우저에서 알림이 막혀 있어요. 주소창 왼쪽 아이콘을 눌러 알림을 허용하세요.', 4000);
+  NOTIFY.on = true; store.set('omgyeo.notify', true); renderBell();
+  toast('다른 창을 보고 있을 때 받으면 알려 드려요');
+};
+
+// ---------- 사진·영상 크게 보기 ----------
+const V = { list: [], i: 0, x: null };
+const isMedia = it => it.kind === 'file' && /^(image|video)\//.test(it.mime || '') && (it.dir === 'out' || it.state === 'done');
+function mediaUrl(it) {
+  if (it.dir === 'in') return it.url;
+  if (!it.viewUrl) it.viewUrl = it.thumb || URL.createObjectURL(it.file);
+  return it.viewUrl;
+}
+function openViewer(it) {
+  V.list = S.feed.filter(isMedia).reverse();   // 오래된 것부터
+  V.i = Math.max(0, V.list.indexOf(it));
+  $('#viewer').hidden = false;
+  document.body.classList.add('noscroll');
+  drawViewer();
+}
+function closeViewer() {
+  $('#viewer').hidden = true;
+  document.body.classList.remove('noscroll');
+  $('#vStage').innerHTML = '';
+}
+function drawViewer() {
+  const it = V.list[V.i];
+  if (!it) return closeViewer();
+  const url = mediaUrl(it);
+  $('#vStage').innerHTML = it.mime.startsWith('video/') ? `<video src="${url}" controls playsinline></video>` : `<img src="${url}" alt="">`;
+  $('#vName').textContent = it.name;
+  $('#vMeta').textContent = `${V.i + 1} / ${V.list.length} · ${it.dir === 'in' ? '←' : '→'} ${it.peerName} · ${fmtSize(it.size)}`;
+  $('#vSave').hidden = it.dir !== 'in';
+  $('#vPrev').disabled = V.i === 0;
+  $('#vNext').disabled = V.i === V.list.length - 1;
+}
+function stepViewer(d) { const n = V.i + d; if (n >= 0 && n < V.list.length) { V.i = n; drawViewer(); } }
+$('#vPrev').onclick = () => stepViewer(-1);
+$('#vNext').onclick = () => stepViewer(1);
+$('#vClose').onclick = closeViewer;
+$('#vSave').onclick = async () => { const it = V.list[V.i]; if (it && await saveBlobs([it])) { it.saved = true; scheduleFeed(); } };
+$('#viewer').addEventListener('click', e => { if (e.target.id === 'viewer') closeViewer(); });
+addEventListener('keydown', e => {
+  if ($('#viewer').hidden) return;
+  if (e.key === 'Escape') closeViewer();
+  else if (e.key === 'ArrowLeft') stepViewer(-1);
+  else if (e.key === 'ArrowRight') stepViewer(1);
+});
+$('#vStage').addEventListener('pointerdown', e => { V.x = e.clientX; });
+$('#vStage').addEventListener('pointerup', e => {
+  if (V.x == null) return;
+  const dx = e.clientX - V.x; V.x = null;
+  if (Math.abs(dx) > 50) stepViewer(dx < 0 ? 1 : -1);
+});
+
+// ---------- 받은 파일 저장 위치 (PC 크롬·엣지) ----------
+async function loadDl() {
+  if (!FS_OK) return;
+  const saved = await idb.get('kv', 'dl');
+  if (saved && saved.handle) S.dl = { handle: saved.handle, ok: await fsPermission(saved.handle, 'readwrite', false) };
+  renderDl();
+}
+function renderDl() {
+  const row = $('#dlRow');
+  if (!FS_OK) { row.hidden = true; return; }
+  row.hidden = false;
+  if (!S.dl) {
+    $('#dlText').innerHTML = '받은 파일은 <b>저장</b>을 눌러 다운로드 폴더에 저장해요.';
+    $('#dlBtns').innerHTML = '<button type="button" data-dl="pick">바로 저장할 폴더 지정</button>';
+  } else if (!S.dl.ok) {
+    $('#dlText').innerHTML = `받은 파일을 <b>'${esc(S.dl.handle.name)}'</b> 폴더에 바로 저장하려면 허용이 필요해요.`;
+    $('#dlBtns').innerHTML = '<button type="button" class="solid" data-dl="allow">폴더 접근 허용</button><button type="button" data-dl="off">해제</button>';
+  } else {
+    $('#dlText').innerHTML = `받은 파일을 <b>'${esc(S.dl.handle.name)}'</b> 폴더에 바로 저장해요. 큰 파일도 메모리를 쓰지 않아요.`;
+    $('#dlBtns').innerHTML = '<button type="button" data-dl="pick">바꾸기</button><button type="button" data-dl="off">해제</button>';
+  }
+}
+$('#dlBtns').addEventListener('click', async e => {
+  const b = e.target.closest('[data-dl]');
+  if (!b) return;
+  if (b.dataset.dl === 'pick') {
+    let handle;
+    try { handle = await showDirectoryPicker({ id: 'omgyeo-dl', mode: 'readwrite', startIn: 'downloads' }); } catch { return; }
+    S.dl = { handle, ok: true };
+    await idb.set('kv', 'dl', { handle });
+    persistStorage();
+    toast(`이제 받은 파일을 '${handle.name}' 폴더에 바로 저장해요`);
+  } else if (b.dataset.dl === 'allow') {
+    S.dl.ok = await fsPermission(S.dl.handle, 'readwrite', true);
+    if (!S.dl.ok) toast('허용해야 폴더에 바로 저장할 수 있어요.');
+  } else if (b.dataset.dl === 'off') {
+    S.dl = null;
+    await idb.del('kv', 'dl');
+    toast('받은 파일은 다시 저장 버튼으로 저장해요');
+  }
+  renderDl();
+});
+
 // ---------- 시작 ----------
 (async function start() {
   // 앱 화면을 캐시해 두어 서버가 잠들어 있어도 화면은 바로 뜨게 함
@@ -1030,4 +1232,6 @@ addEventListener('beforeunload', e => { if (busy()) { e.preventDefault(); e.retu
   await initCrypto();
   connect();
   loadInfo();
+  loadDl();
+  renderBell();
 })();

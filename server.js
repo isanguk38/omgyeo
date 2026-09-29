@@ -94,7 +94,8 @@ function newCode() {
   return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 }
 // pub: 종단간 암호화용 공개키(서버는 전달만 함), dev: 페이지가 살아 있는 동안 유지되는 기기 식별자(이어받기용)
-const info = ws => ({ id: ws.id, name: ws.name, kind: ws.kind, pub: ws.pub, dev: ws.dev });
+// caps: 기기 능력(fs: 폴더 읽고 쓰기 가능, pid: 브라우저 고유 표식 — 폴더 동기화 짝 기억용)
+const info = ws => ({ id: ws.id, name: ws.name, kind: ws.kind, pub: ws.pub, dev: ws.dev, caps: ws.caps });
 const sendJSON = (ws, obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
 
 function join(ws, roomId) {
@@ -136,6 +137,7 @@ wss.on('connection', ws => {
   ws.room = null;
   ws.pub = null;
   ws.dev = ws.id;
+  ws.caps = { fs: false, pid: ws.id };
   ws.alive = true;
   ws.on('pong', () => { ws.alive = true; });
   sendJSON(ws, { type: 'welcome', id: ws.id });
@@ -159,6 +161,10 @@ wss.on('connection', ws => {
         ws.kind = ['pc', 'phone', 'tablet'].includes(m.kind) ? m.kind : 'pc';
         ws.pub = typeof m.pub === 'string' && m.pub.length <= 200 ? m.pub : null;
         ws.dev = typeof m.dev === 'string' && /^[a-z0-9]{8,32}$/.test(m.dev) ? m.dev : ws.id;
+        ws.caps = {
+          fs: !!(m.caps && m.caps.fs),
+          pid: m.caps && typeof m.caps.pid === 'string' && /^[a-z0-9]{8,32}$/.test(m.caps.pid) ? m.caps.pid : ws.dev,
+        };
         break;
       case 'create':
         join(ws, randomId(10));
