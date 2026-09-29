@@ -594,19 +594,25 @@ function buildZip(entries) {
   let offset = 0;
   for (const e of entries) {
     const name = enc.encode(e.path);
+    // UTF-8 이름 표시를 무시하는 오래된 압축 프로그램용 Unicode Path 확장 필드(0x7075)
+    const extra = new DataView(new ArrayBuffer(9 + name.length));
+    extra.setUint16(0, 0x7075, true); extra.setUint16(2, 5 + name.length, true);
+    extra.setUint8(4, 1); extra.setUint32(5, crc32(0, name), true);
+    new Uint8Array(extra.buffer).set(name, 9);
+    const ex = new Uint8Array(extra.buffer);
     const lh = new DataView(new ArrayBuffer(30));
     lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); // UTF-8 이름
     lh.setUint16(8, 0, true); lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true);
     lh.setUint32(14, e.crc, true); lh.setUint32(18, e.size, true); lh.setUint32(22, e.size, true);
-    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
-    parts.push(new Uint8Array(lh.buffer), name, e.blob);
+    lh.setUint16(26, name.length, true); lh.setUint16(28, ex.length, true);
+    parts.push(new Uint8Array(lh.buffer), name, ex, e.blob);
     const ch = new DataView(new ArrayBuffer(46));
     ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
     ch.setUint16(10, 0, true); ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true);
     ch.setUint32(16, e.crc, true); ch.setUint32(20, e.size, true); ch.setUint32(24, e.size, true);
-    ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
-    central.push(new Uint8Array(ch.buffer), name);
-    offset += 30 + name.length + e.size;
+    ch.setUint16(28, name.length, true); ch.setUint16(30, ex.length, true); ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), name, ex);
+    offset += 30 + name.length + ex.length + e.size;
   }
   const cdSize = central.reduce((s, a) => s + a.length, 0);
   const end = new DataView(new ArrayBuffer(22));
