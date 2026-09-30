@@ -1721,8 +1721,9 @@ function onJoinRequest(m) {
     <div class="jr-btns"><button type="button" class="solid" data-jr="allow">허용</button><button type="button" data-jr="deny">거절</button></div>`;
   box.querySelector('b').textContent = `${peer.name || '새 기기'} (${KIND_LABEL[peer.kind] || '기기'})이(가) 들어오려고 해요`;
   box.querySelector('[data-jr="allow"]').onclick = () => {
-    if (box.querySelector('input').checked) trust(S.room, [pid]);
-    sendServer({ type: 'join-answer', reqId: m.reqId, allow: true });
+    const remember = box.querySelector('input').checked;
+    if (remember) trust(S.room, [pid]);
+    sendServer({ type: 'join-answer', reqId: m.reqId, allow: true, remember });
     box.remove();
   };
   box.querySelector('[data-jr="deny"]').onclick = () => {

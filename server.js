@@ -126,7 +126,8 @@ const server = hasCert
   : http.createServer(handle);
 
 // ---------- 방과 기기 ----------
-const rooms = new Map();   // roomId -> { peers: Map<id, ws>, code, pending: Map<reqId, {ws, timer}> }
+// known: 이 방에 들어온 적 있는 브라우저(pid). 잠깐 나갔다 돌아오면 기존 기기의 허용 없이 바로 들어옴
+const rooms = new Map();   // roomId -> { peers: Map<id, ws>, code, pending: Map<reqId, {ws, timer}>, known: Set<pid> }
 const codes = new Map();   // 6자리 코드 -> roomId
 const ID_CHARS = 'abcdefghijkmnpqrstuvwxyz23456789';
 const randomId = n => Array.from(crypto.randomBytes(n), b => ID_CHARS[b % ID_CHARS.length]).join('');
@@ -169,6 +170,12 @@ function requestJoin(ws, roomId) {
   if (ws.room === roomId) return;
   const room = rooms.get(roomId);
   if (!room || room.peers.size === 0) return admit(ws, roomId);   // 빈 방(새 연결·혼자 재접속)은 바로
+  // 같은 페이지의 끊긴 이전 연결이 아직 남아 있으면 정리 (요청이 죽은 연결로 가지 않게)
+  for (const other of [...room.peers.values()]) if (other !== ws && other.dev === ws.dev) { leave(other); other.terminate(); }
+  const pid = ws.caps && ws.caps.pid;
+  if (!rooms.has(roomId) || rooms.get(roomId).peers.size === 0) return admit(ws, roomId);
+  // 전에 이 방에 들어왔던 기기는 상대 화면이 잠들어 있어도 바로 들어옴
+  if (pid && room.known.has(pid)) return admit(ws, roomId);
   leave(ws);
   cancelPending(ws);
   const reqId = randomId(10);
@@ -178,7 +185,7 @@ function requestJoin(ws, roomId) {
   for (const other of room.peers.values()) sendJSON(other, { type: 'join-request', reqId, peer: info(ws) });
   sendJSON(ws, { type: 'waiting', room: roomId });
 }
-function answer(roomId, reqId, allow, reason) {
+function answer(roomId, reqId, allow, reason, remember = true) {
   const room = rooms.get(roomId);
   const req = room && room.pending.get(reqId);
   if (!req) return;
@@ -186,7 +193,7 @@ function answer(roomId, reqId, allow, reason) {
   room.pending.delete(reqId);
   req.ws.pending = null;
   for (const other of room.peers.values()) sendJSON(other, { type: 'join-done', reqId, allowed: !!allow });
-  if (allow) admit(req.ws, roomId);
+  if (allow) admit(req.ws, roomId, remember);
   else sendJSON(req.ws, { type: 'join-denied', reason: reason || 'denied' });
 }
 function cancelPending(ws) {
@@ -200,19 +207,20 @@ function cancelPending(ws) {
   room.pending.delete(reqId);
   for (const other of room.peers.values()) sendJSON(other, { type: 'join-done', reqId, allowed: false });
 }
-function admit(ws, roomId) {
+function admit(ws, roomId, remember = true) {
   if (ws.room === roomId) return;
   leave(ws);
   cancelPending(ws);
   let room = rooms.get(roomId);
   if (!room) {
-    room = { peers: new Map(), code: newCode(), pending: new Map() };
+    room = { peers: new Map(), code: newCode(), pending: new Map(), known: new Set() };
     rooms.set(roomId, room);
     codes.set(room.code, roomId);
   }
   for (const other of room.peers.values()) sendJSON(other, { type: 'peer-joined', peer: info(ws) });
   const peers = [...room.peers.values()].map(info);
   room.peers.set(ws.id, ws);
+  if (remember && ws.caps && ws.caps.pid) room.known.add(ws.caps.pid);
   ws.room = roomId;
   sendJSON(ws, { type: 'joined', room: roomId, code: room.code, you: ws.id, peers });
 }
@@ -297,7 +305,7 @@ wss.on('connection', (ws, req) => {
         break;
       }
       case 'join-answer':   // 기존 기기가 새 기기를 허용/거절
-        if (ws.room) answer(ws.room, String(m.reqId || ''), !!m.allow, 'denied');
+        if (ws.room) answer(ws.room, String(m.reqId || ''), !!m.allow, 'denied', m.remember !== false);
         break;
       case 'leave':
         cancelPending(ws);
