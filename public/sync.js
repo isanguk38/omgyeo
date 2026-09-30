@@ -785,10 +785,10 @@ Sync.onCtrl = async (p, m) => {
     // 공유하는 쪽
     case 'sync-waiting': if (mine) { sess.state = 'waiting'; sess.waitWhy = m.why === 'perm' ? 'perm' : 'ask'; syncRender(); } return;
     case 'sync-scan':   // 상대 PC가 자기 폴더를 훑는 중 (진행률)
-      if (mine) { sess.remoteScan = { d: Number(m.done) || 0, n: Number(m.total) || 0 }; sess.busy = false; syncRender(); }
+      if (mine) { if (sess.state === 'waiting') sess.state = 'ready'; sess.remoteScan = { d: Number(m.done) || 0, n: Number(m.total) || 0 }; sess.busy = false; syncRender(); }   // 상대가 위치를 골랐으면 '기다림'에서 진행 표시로
       return;
     case 'sync-busy':   // 상대 PC가 파일을 받는 중이라 끝난 뒤 비교
-      if (mine) { sess.busy = true; syncRender(); }
+      if (mine) { if (sess.state === 'waiting') sess.state = 'ready'; sess.busy = true; syncRender(); }
       return;
     case 'sync-index':
       if (!mine) return;
