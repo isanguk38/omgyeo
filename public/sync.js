@@ -23,7 +23,14 @@ const Sync = {
 
 // ---------- 시작 ----------
 Sync.init = async () => {
-  if (!FS_OK) return;
+  if (!FS_OK) {
+    if (IS_MOBILE) return;   // 폰은 폴더 동기화를 지원하지 않아 영역 자체를 숨김
+    $('#syncBox').hidden = false;
+    $('#syncBox').innerHTML = `<div class="sync-head"><h2>폴더 동기화</h2></div><p class="sync-note">${globalThis.isSecureContext
+      ? '폴더 동기화와 바로 저장은 크롬이나 엣지 브라우저에서만 돼요.'
+      : '폴더 동기화와 바로 저장은 https 주소에서만 켜져요. 배포 주소나 localhost로 열어 주세요.'}</p>`;
+    return;
+  }
   $('#syncBox').hidden = false;
   const saved = await idb.get('kv', 'share');
   if (saved && saved.handle) {

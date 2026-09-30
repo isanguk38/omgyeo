@@ -268,6 +268,7 @@ function addPeer(info, initiator) {
   p.caps = info.caps || {};
   p.keyP = deriveKey(p);
   setTimeout(() => { if (alive(p) && typeof Sync !== 'undefined') Sync.onPeerJoined(p); }, 0);
+  setTimeout(() => sendTombs(p), 500);
 
   // 끊겼다 돌아온 기기면 멈춘 전송을 이어서
   const back = S.parked.filter(j => j.dev === p.dev);
@@ -417,8 +418,10 @@ function onCtrl(p, m) {
       if (inc && inc.state !== 'done') { inc.state = 'cancelled'; inc.parts = null; S.partials.delete(m.uid); scheduleFeed(); }
       return;
     }
+    case 'msg-del':   // 상대가 지운 메시지 (지금 지웠으면 live: 이 기기의 지금 시각까지 지움)
+      return applyDelete(S.room, (m.mids || []).map(String).slice(0, 5000), m.clear ? (m.live ? Date.now() : Number(m.clear)) : 0);
     case 'text':
-      { const it = { kind: 'text', dir: 'in', text: String(m.text), peerName: p.name, time: Date.now() }; addFeed(it); persistItem(it); }
+      { const it = { kind: 'text', dir: 'in', mid: m.mid ? String(m.mid).slice(0, 40) : null, text: String(m.text), peerName: p.name, time: Date.now() }; addFeed(it); persistItem(it); }
       toast(`${p.name}에서 글이 왔어요`);
       announce(`${p.name}에서 글이 왔어요`, String(m.text).slice(0, 120));
       return;
@@ -431,7 +434,8 @@ function targetPeers() {
   return S.targets ? all.filter(p => S.targets.has(p.id)) : all;
 }
 function makeJob(p, file, path, extra) {
-  return { kind: 'file', dir: 'out', uid: randStr(12), dev: p.dev, peer: p.id, peerName: p.name, file,
+  const uid = randStr(12);
+  return { kind: 'file', dir: 'out', uid, mid: extra && extra.bid ? null : uid, dev: p.dev, peer: p.id, peerName: p.name, file,
     name: cleanName(file.name), path, size: file.size, mime: file.type, done: 0, state: 'queued', time: Date.now(), ...extra };
 }
 // entries: [{ file, path }] — path에 '/'가 있으면 폴더 안의 파일
@@ -457,7 +461,7 @@ function sendEntries(entries) {
     for (const [top, list] of groups) {
       const bid = randStr(10);
       const total = list.reduce((s, e) => s + e.file.size, 0);
-      const b = { kind: 'bundle', dir: 'out', name: cleanName(top), count: list.length, total, size: total, jobs: [], peerName: p.name, time: Date.now(), state: 'queued', done: 0 };
+      const b = { kind: 'bundle', dir: 'out', mid: `b${bid}`, name: cleanName(top), count: list.length, total, size: total, jobs: [], peerName: p.name, time: Date.now(), state: 'queued', done: 0 };
       addFeed(b);
       for (const e of list) {
         const job = makeJob(p, e.file, e.path, { bid, bname: top, bcount: list.length, btotal: total, bundle: b });
@@ -537,8 +541,9 @@ async function sendJob(p, job) {
 function sendText(text) {
   const targets = targetPeers();
   if (!targets.length) return toast('먼저 받을 기기를 연결하세요.');
-  for (const p of targets) sendCtrl(p, { t: 'text', text }).catch(() => toast(`${p.name}에 보내지 못했어요`));
-  const it = { kind: 'text', dir: 'out', text, peerName: targets.map(p => p.name).join(', '), time: Date.now() };
+  const mid = randStr(12);
+  for (const p of targets) sendCtrl(p, { t: 'text', text, mid }).catch(() => toast(`${p.name}에 보내지 못했어요`));
+  const it = { kind: 'text', dir: 'out', mid, text, peerName: targets.map(p => p.name).join(', '), time: Date.now() };
   addFeed(it);
   persistItem(it);
 }
@@ -593,7 +598,7 @@ async function onFileOffer(p, m) {
       const key = `${p.dev}:${m.bid}`;
       let b = S.bundlesIn.get(key);
       if (!b) {
-        b = { kind: 'bundle', dir: 'in', key, name: cleanName(m.bname), count: Number(m.bcount) || 1, total: Number(m.btotal) || 0, size: Number(m.btotal) || 0, files: [], peerName: p.name, time: Date.now(), state: 'receiving', done: 0 };
+        b = { kind: 'bundle', dir: 'in', key, mid: `b${String(m.bid).slice(0, 20)}`, name: cleanName(m.bname), count: Number(m.bcount) || 1, total: Number(m.btotal) || 0, size: Number(m.btotal) || 0, files: [], peerName: p.name, time: Date.now(), state: 'receiving', done: 0 };
         S.bundlesIn.set(key, b);
         addFeed(b);
       }
@@ -753,6 +758,9 @@ function renderRecent() {
     <li><div class="rn"><b>${esc(r.names.join(', '))}</b><small>${ago(r.ts)}<span data-count="${esc(r.room)}"></span></small></div>
     <button type="button" data-rejoin="${esc(r.room)}">다시 연결</button>
     <button type="button" class="x" data-forget="${esc(r.room)}" aria-label="연결과 기록 지우기" title="연결과 기록 지우기">✕</button></li>`).join('');
+  if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(e => {
+    $('#storageInfo').textContent = `이 브라우저에 저장된 기록·파일 ${fmtSize(e.usage || 0)}${e.quota ? ` · 사용 가능 ${fmtSize(e.quota)}` : ''}`;
+  }).catch(() => {});
   for (const r of list) idb.msgList(r.room).then(recs => recs.filter(x => !x.owner || x.owner === PERSIST_ID).length).then(n => {
     const el = document.querySelector(`[data-count="${r.room}"]`);
     if (el && n) el.textContent = ` · 기록 ${n}개`;
@@ -936,7 +944,7 @@ function buildItem(it) {
     const isUrl = /^https?:\/\/\S+$/.test(it.text.trim());
     li.innerHTML = `<div class="who">${who}</div>
       <div class="row"><div class="bubble"><div class="txt"></div>
-        <div class="act">${isUrl ? '<button type="button" data-a="open">열기</button>' : ''}<button type="button" data-a="copy">복사</button></div></div>
+        <div class="act">${isUrl ? '<button type="button" data-a="open">열기</button>' : ''}<button type="button" data-a="copy">복사</button><button type="button" class="del-btn" data-a="del" title="모두에게서 삭제">삭제</button></div></div>
       <span class="time">${hhmm(it.time)}</span></div>`;
     li.querySelector('.txt').textContent = it.text;
     return;
@@ -957,7 +965,9 @@ const SAVE_MAX = 200 * 1024 * 1024;   // 파일 내용은 항목당 200MB까지�
 async function persistItem(it) {
   if (!it || it.persisted || !it.room) return;
   it.persisted = true;
-  const rec = { id: randStr(14), room: it.room, owner: PERSIST_ID, time: it.time, kind: it.kind, dir: it.dir, peerName: it.peerName };
+  const mid = it.mid || (it.kind === 'file' ? it.uid : null) || randStr(12);
+  it.mid = mid;
+  const rec = { id: `${PERSIST_ID}:${mid}`, mid, room: it.room, owner: PERSIST_ID, time: it.time, kind: it.kind, dir: it.dir, peerName: it.peerName };
   if (it.kind === 'text') rec.text = it.text;
   else if (it.kind === 'file') {
     Object.assign(rec, { name: it.name, size: it.size, mime: it.mime, onDisk: !!it.onDisk });
@@ -988,7 +998,7 @@ function onOutDone(job) {
   } else persistItem(job);
 }
 function restoreItem(r) {
-  const base = { persisted: true, restored: true, room: r.room, time: r.time, dir: r.dir, peerName: r.peerName, kind: r.kind };
+  const base = { persisted: true, restored: true, mid: r.mid || null, room: r.room, time: r.time, dir: r.dir, peerName: r.peerName, kind: r.kind };
   if (r.kind === 'text') return { ...base, text: r.text };
   if (r.kind === 'file') {
     const it = { ...base, name: r.name, size: r.size, mime: r.mime || '', done: r.size, state: 'done', onDisk: r.onDisk, fh: r.fh };
@@ -1011,34 +1021,125 @@ function restoreItem(r) {
   if (files.some(f => !f.blob && !f.fh)) it.partial = true;
   return it;
 }
+// 기록이 많아도 대화창이 무거워지지 않게 최근 100개만 먼저 그리고, 위에서 더 불러옴
+const HIST_PAGE = 100;
 async function loadRoomHistory(room) {
   const recs = (await idb.msgList(room)).filter(r => !r.owner || r.owner === PERSIST_ID);   // 같은 브라우저의 다른 탭 기록은 제외
   if (S.shownRoom !== room) return;
   recs.sort((a, b) => a.time - b.time);
-  for (const r of recs) addFeed(restoreItem(r), true);
-  nextFrame(scrollBottom);
+  S.hist = { room, recs, shown: Math.min(HIST_PAGE, recs.length) };
+  renderHistory(true);
 }
+function renderHistory(toBottom) {
+  const h = S.hist;
+  if (!h) return;
+  const f = feedBox();
+  const fromBottom = f.scrollHeight - f.scrollTop;
+  const live = S.feed.filter(it => !it.restored);   // 지금 주고받는 중인 항목은 유지
+  clearFeed();
+  const older = h.recs.length - h.shown;
+  if (older > 0) {
+    const li = document.createElement('li');
+    li.className = 'more';
+    li.innerHTML = `<button type="button" data-more>이전 기록 ${older.toLocaleString()}개 더 보기</button>`;
+    f.appendChild(li);
+  }
+  for (const r of h.recs.slice(h.recs.length - h.shown)) addFeed(restoreItem(r), true);
+  for (const it of live) addFeed(it, true);
+  if (toBottom) nextFrame(scrollBottom);
+  else nextFrame(() => { f.scrollTop = f.scrollHeight - fromBottom; });
+}
+feedBox().addEventListener('click', e => {
+  if (!e.target.closest('[data-more]') || !S.hist) return;
+  S.hist.shown = Math.min(S.hist.recs.length, S.hist.shown + HIST_PAGE);
+  renderHistory(false);
+});
 function showRoom(room) {
   if (S.shownRoom === room) return;
   clearFeed();
+  S.hist = null;
   S.shownRoom = room;
   if (room) loadRoomHistory(room);
+}
+
+// ---------- 지우기: 상대 기기에서도 지워지도록 ----------
+// 메시지마다 양쪽이 같은 id(mid)를 가짐. 지운 기록은 "삭제 표시"로 30일 보관했다가
+// 그 방에서 다른 기기와 연결될 때마다 전달하므로, 지금 연결돼 있지 않은 기기에서도 나중에 지워짐.
+const TOMB_DAYS = 30;
+const midOf = it => it.mid || null;
+const finished = it => it.kind === 'text' || it.restored || ['done', 'failed', 'cancelled'].includes(it.state);
+async function getTombs(room) { return (await idb.get('kv', `tomb:${room}`)) || { mids: [], clear: 0 }; }
+async function addTombs(room, mids, clear) {
+  const t = await getTombs(room);
+  const now = Date.now();
+  for (const m of mids || []) t.mids.push([m, now]);
+  if (clear) t.clear = Math.max(t.clear || 0, clear);
+  t.mids = t.mids.filter(([, ts]) => now - ts < TOMB_DAYS * 864e5).slice(-3000);
+  await idb.set('kv', `tomb:${room}`, t);
+}
+async function sendTombs(p) {
+  if (!S.room || !alive(p)) return;
+  const t = await getTombs(S.room);
+  if (!t.mids.length && !t.clear) return;
+  sendCtrl(p, { t: 'msg-del', mids: t.mids.map(x => x[0]), clear: t.clear }).catch(() => {});
+}
+function removeFeedItem(it) {
+  if (it.url) URL.revokeObjectURL(it.url);
+  if (it.el) it.el.remove();
+  S.feed = S.feed.filter(x => x !== it);
+  // 비게 된 날짜 구분선 정리
+  const kids = [...feedBox().children];
+  kids.forEach((li, i) => { if (li.classList.contains('day') && (!kids[i + 1] || kids[i + 1].classList.contains('day'))) li.remove(); });
+  S.lastDay = S.feed.length ? dayKey(S.feed[S.feed.length - 1].time) : null;
+  if (!S.feed.length) $('#feedEmpty').hidden = false;
+}
+// 이 기기에서 지우기 (mids에 든 메시지, 또는 clear 시각 이전의 전부)
+async function applyDelete(room, mids, clear) {
+  const set = new Set(mids || []);
+  const hit = r => (r.mid && set.has(r.mid)) || (clear && r.time <= clear);
+  let n = 0;
+  for (const r of await idb.msgList(room)) {
+    if (r.owner && r.owner !== PERSIST_ID) continue;
+    if (hit(r)) { await idb.msgDel(r.id); n++; }
+  }
+  if (S.hist && S.hist.room === room) {
+    S.hist.recs = S.hist.recs.filter(r => !hit(r));
+    S.hist.shown = Math.min(S.hist.shown, S.hist.recs.length);
+  }
+  if (room === S.room) for (const it of S.feed.filter(x => finished(x) && ((midOf(x) && set.has(midOf(x))) || (clear && x.time <= clear)))) removeFeedItem(it);
+  if (room === S.room && S.hist && S.hist.recs.length > S.hist.shown) renderHistory(false);
+  return n;
+}
+async function deleteForAll(mids, clear) {
+  const room = S.room;
+  if (!room) return;
+  await applyDelete(room, mids, clear);
+  await addTombs(room, mids, clear);
+  const peers = [...S.peers.values()];
+  for (const p of peers) sendCtrl(p, { t: 'msg-del', mids: mids || [], clear: clear || 0, live: true }).catch(() => {});
+  return peers.length;
 }
 $('#clearHistBtn').onclick = async () => {
   const b = $('#clearHistBtn');
   if (b.dataset.armed !== '1') {
-    b.dataset.armed = '1'; b.textContent = '한 번 더 누르면 지워요';
-    setTimeout(() => { b.dataset.armed = ''; b.textContent = '기록 지우기'; }, 3000);
+    b.dataset.armed = '1'; b.textContent = '연결된 기기에서도 지워져요 · 한 번 더 누르기';
+    setTimeout(() => { b.dataset.armed = ''; b.textContent = '기록 지우기'; }, 3500);
     return;
   }
   b.dataset.armed = ''; b.textContent = '기록 지우기';
-  if (!S.room) return;
-  await idb.msgDelRoom(S.room);
-  const keep = S.feed.filter(it => !['done', 'failed', 'cancelled'].includes(it.state) && it.kind !== 'text');
-  clearFeed();
-  for (const it of keep) addFeed(it, true);
-  toast('이 연결의 대화와 파일 기록을 지웠어요');
+  const n = await deleteForAll([], Date.now());
+  toast(n ? '이 연결의 기록을 지웠어요. 연결된 기기에서도 지워졌어요.' : '이 연결의 기록을 지웠어요. 다른 기기는 다음에 연결될 때 지워져요.', 3500);
 };
+async function deleteOne(it) {
+  const mid = midOf(it);
+  if (!mid) {   // 이 기능 전에 저장된 기록은 id가 없어 이 기기에서만 지움
+    if (it.restored) for (const r of await idb.msgList(S.room)) if (r.time === it.time && r.kind === it.kind && r.owner === PERSIST_ID && !r.mid) await idb.msgDel(r.id);
+    removeFeedItem(it);
+    return toast('이 기기에서 지웠어요 (예전 기록이라 상대 기기에는 반영되지 않아요)');
+  }
+  const n = await deleteForAll([mid], 0);
+  toast(n ? '지웠어요. 연결된 기기에서도 지워졌어요.' : '지웠어요. 상대 기기는 다음에 연결될 때 지워져요.');
+}
 
 // 폴더는 안의 파일들 상태를 모아서 하나로 보여 줌
 function bundleState(b) {
@@ -1103,6 +1204,7 @@ function updateItem(it) {
     failed: '<span class="st fail">실패</span>',
     cancelled: '<span class="st fail">취소됨</span>',
   };
+  const delBtn = finished(it) ? '<button type="button" class="del-btn" data-a="del" title="모두에게서 삭제">삭제</button>' : '';
   if (it.state === 'done' && it.gone) {
     r.act.innerHTML = it.gone === 'big' ? '<span class="st">기록만 남음 · 파일이 커서 내용은 보관하지 않았어요</span>'
       : '<span class="st">저장 폴더에서 파일을 찾지 못했어요</span>';
@@ -1118,11 +1220,12 @@ function updateItem(it) {
         `<button type="button" class="${zipOk ? '' : 'solid'}" data-a="each">파일 각각 저장</button>`;
     } else {
       const viewable = /^(image|video|audio|text)\/|pdf$/.test(it.mime);
-      if (!it.blob) { r.act.innerHTML = '<span class="st">불러오는 중…</span>'; return; }
+      if (!it.blob) { r.act.innerHTML = `<span class="st">불러오는 중…</span>${delBtn}`; return; }
       r.act.innerHTML = (viewable && !IS_MOBILE ? '<button type="button" data-a="view">열기</button>' : '') +
         `<button type="button" class="${it.saved ? '' : 'solid'}" data-a="save">${it.saved ? '다시 저장' : '저장'}</button>`;
     }
   } else r.act.innerHTML = L[it.state] || '';
+  if (delBtn) r.act.insertAdjacentHTML('beforeend', delBtn);
 }
 let feedQueued = false;
 function scheduleFeed() {
@@ -1166,6 +1269,14 @@ $('#feed').addEventListener('click', async e => {
   else if (a === 'view') window.open(it.url, '_blank', 'noopener');
   else if (a === 'copy') toast((await copyText(it.text)) ? '복사했어요' : '복사하지 못했어요. 글을 길게 눌러 복사하세요.');
   else if (a === 'open') window.open(it.text.trim(), '_blank', 'noopener');
+  else if (a === 'del') {
+    if (b.dataset.armed !== '1') {   // 실수 방지: 두 번 눌러야 지움
+      b.dataset.armed = '1'; b.textContent = '모두에게서 삭제?'; b.classList.add('armed');
+      setTimeout(() => { if (b.isConnected) { b.dataset.armed = ''; b.textContent = '삭제'; b.classList.remove('armed'); } }, 3000);
+      return;
+    }
+    deleteOne(it);
+  }
 });
 $('#saveAllBtn').onclick = async () => {
   const list = S.feed.filter(it => it.dir === 'in' && it.kind === 'file' && it.state === 'done' && !it.saved && it.blob);
@@ -1274,6 +1385,7 @@ function renderBell() {
   $('#bellBtn').title = on ? '알림 켜짐 · 누르면 끔' : '받으면 알림 받기';
 }
 $('#bellBtn').onclick = async () => {
+  if (!globalThis.isSecureContext) return toast('알림은 https 주소에서만 켤 수 있어요. 배포 주소나 localhost로 열어 주세요.', 4000);
   if (!('Notification' in window)) return toast('이 브라우저는 알림을 지원하지 않아요. 아이폰은 홈 화면에 추가한 뒤에만 돼요.');
   if (NOTIFY.on) { NOTIFY.on = false; store.set('omgyeo.notify', false); renderBell(); return toast('알림을 껐어요'); }
   let perm = Notification.permission;
@@ -1386,6 +1498,7 @@ $('#dlBtns').addEventListener('click', async e => {
   else if (last) S.want = { room: last };      // 지난번 연결로 자동 재접속
   show('home');
   setNet(false);
+  if (!globalThis.isSecureContext) $('#secureNote').hidden = false;
   await initCrypto();
   connect();
   loadInfo();

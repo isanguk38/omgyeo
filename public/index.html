@@ -23,6 +23,11 @@
   </div>
 </header>
 
+<div class="secure-note" id="secureNote" hidden>
+  <b>지금은 보안 연결(https)이 아닌 주소로 열려 있어요.</b>
+  <span>그래서 폴더 동기화, 바로 저장 폴더, 알림, 종단간 암호화가 꺼져 있어요. 배포한 https 주소로 열거나, 서버를 켠 PC에서는 http://localhost:8080 으로 열어 주세요.</span>
+</div>
+
 <div class="wake" id="wake" role="status" hidden>
   <span class="spin" aria-hidden="true"></span>
   <div><b id="wakeTitle">서버에 연결하는 중…</b><span id="wakeSub"></span></div>
@@ -50,6 +55,7 @@
   <section class="recent" id="recentBox" hidden>
     <h2>이전에 연결한 기기</h2>
     <ul id="recentList"></ul>
+    <p class="storage" id="storageInfo"></p>
   </section>
 </main>
 

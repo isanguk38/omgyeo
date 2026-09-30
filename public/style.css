@@ -337,3 +337,13 @@ dialog.wide[open]{display:flex}
   .fi .act,.fi .st{grid-column:1/-1;justify-content:flex-end}
 }
 .cl-row.add,.cl-row.mod,.cl-row.del{color:var(--ink)}
+
+.secure-note{max-width:1080px;margin:0 auto 12px;display:flex;flex-direction:column;gap:2px;background:color-mix(in srgb,var(--warn) 14%,var(--surface));border:1px solid color-mix(in srgb,var(--warn) 40%,transparent);border-radius:14px;padding:12px 16px;font-size:13px}
+.secure-note span{color:var(--muted)}
+.storage{margin:0;font-size:12px;color:var(--muted)}
+.feed .more{align-self:center}
+.feed .more button{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:6px 14px;font-size:12px;font-weight:600;color:var(--muted)}
+.bubble .act button.del-btn{color:var(--muted);border-color:transparent;background:none}
+.bubble .act button.del-btn:hover{color:var(--bad)}
+.bubble .act button.del-btn.armed{color:var(--bad);border-color:var(--bad);background:var(--surface)}
+.sync-note{margin:0;font-size:13px;color:var(--muted);background:var(--surface);border:1px dashed var(--line);border-radius:14px;padding:14px}

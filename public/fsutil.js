@@ -36,6 +36,7 @@ const idb = (() => {
     del: (store, key) => run(store, 'readwrite', s => { s.delete(key); }).catch(() => {}),
     msgPut: rec => run('msgs', 'readwrite', s => { s.put(rec); }).catch(err => console.warn('idb msg', err)),
     msgList: room => run('msgs', 'readonly', s => s.index('room').getAll(room)).catch(() => []),
+    msgDel: id => run('msgs', 'readwrite', s => { s.delete(id); }).catch(() => {}),
     async msgDelRoom(room) {
       const db = await open();
       return new Promise(resolve => {
