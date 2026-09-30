@@ -962,6 +962,7 @@ function peerRow(sess) {
     }
     st = `<span class="busy">보내는 중 ${pg.done}/${pg.total}개 · ${fmtSize(pg.bytes)} / ${fmtSize(pg.totalBytes)}${tail}</span>`;
   } else if (sess.state === 'ready' && !sess.remote) st = '<span class="busy"><span class="spin"></span>상대 PC의 폴더 목록을 기다리는 중</span>';
+  else if (sess.state === 'ready' && !Sync.local) st = `<span class="busy"><span class="spin"></span>${Sync.scanProg ? `내 폴더 확인 중 ${Sync.scanProg.d.toLocaleString()} / ${Sync.scanProg.n.toLocaleString()}개` : '내 폴더 확인 중…'}</span>`;   // 규칙을 바꾼 직후 등 내 목록을 다시 만드는 중
   else if (sess.state === 'ready' && d) {
     const parts = [];
     if (d.send.length) parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개 · ${fmtSize(d.bytes)} · ${fmtDuration(estimate(sess, d.bytes, d.send.length))}`);
