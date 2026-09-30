@@ -631,3 +631,56 @@ body.in-room > .notify-ask{flex:none}
 .doc-table thead th{background:var(--sunk);font-size:12.5px;color:var(--muted);font-weight:600}
 .doc-table tr:last-child td{border-bottom:0}
 .doc-page > .site-foot{max-width:720px;margin:0 auto 32px}
+
+/* ---------- 마피아 게임 (대화 위 게임 판 + 사회자 안내) ---------- */
+:root{--night:#27304A;--night-ink:#E8ECF8;--night-soft:#3A4566}
+@media (prefers-color-scheme:dark){:root{--night:#1C2236;--night-ink:#DDE3F5;--night-soft:#2C3552}}
+.tab-tools .mafia-btn{color:var(--ink)}
+.mf-box{flex:none;max-height:48%;overflow-y:auto;border-bottom:1px solid var(--line);background:var(--surface);padding:12px 14px;display:flex;flex-direction:column;gap:10px;font-size:14px}
+.mf-box.night{background:var(--night);color:var(--night-ink);border-color:var(--night-soft)}
+.mf-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.mf-phase{font-weight:800;font-size:16px}
+.mf-clock{font-family:var(--mono);font-weight:700;font-variant-numeric:tabular-nums;font-size:15px}
+.mf-me{display:flex;flex-direction:column;gap:2px}
+.mf-todo{font-weight:600}
+.mf-tip{opacity:.75;font-size:12.5px}
+.mf-role{padding:1px 8px;border-radius:999px;background:var(--sunk);color:var(--ink)}
+.mf-role.mafia{background:var(--bad);color:#fff}
+.mf-dead{color:var(--bad);font-weight:700}
+.mf-players{display:flex;flex-wrap:wrap;gap:6px}
+.mf-p{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:12px;padding:7px 11px;font-size:13.5px;font-weight:600}
+.mf-p:not(:disabled):hover{border-color:var(--accent)}
+.mf-p:disabled{cursor:default}
+.mf-p.me{border-style:dashed}
+.mf-p.picked{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.mf-p.dead{opacity:.5;text-decoration:line-through}
+.mf-box.night .mf-p{background:var(--night-soft);border-color:transparent;color:var(--night-ink)}
+.mf-box.night .mf-p.picked{background:var(--accent);color:var(--accent-ink)}
+.mf-badge{font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;background:var(--sunk);color:var(--muted);text-decoration:none}
+.mf-badge.mafia{background:var(--bad);color:#fff}
+.mf-badge.doctor{background:var(--ok-soft);color:var(--ok)}
+.mf-badge.police{background:#DCE6FB;color:#2B4C9B}
+.mf-votes{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--accent-text)}
+.mf-p.picked .mf-votes{color:inherit}
+.mf-out{font-size:11px;font-weight:700;color:var(--bad);text-decoration:none}
+.mf-secret{display:flex;flex-direction:column;gap:6px;background:var(--night-soft);border-radius:12px;padding:10px 12px}
+.mf-log{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px;max-height:110px;overflow-y:auto;font-size:13px}
+.mf-chat{display:flex;gap:6px}
+.mf-chat input{flex:1;min-width:0;border:0;border-radius:10px;padding:7px 10px;background:var(--night);color:var(--night-ink)}
+.mf-chat button{border:0;border-radius:10px;padding:7px 12px;font-weight:700;background:var(--accent);color:var(--accent-ink)}
+.mf-ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.mf-ctl button:not(.link){border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:10px;padding:6px 14px;font-weight:600;font-size:13px}
+.mf-ctl button.solid{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.mf-box.night .mf-ctl .link.muted{color:var(--night-ink);opacity:.7}
+.feed .narr{align-self:center;max-width:min(92%,560px);display:flex;flex-direction:column;align-items:center;gap:2px;text-align:center;background:var(--sunk);border-radius:14px;padding:8px 14px;font-size:13.5px;line-height:1.5}
+.narr-who{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.04em}
+.feed .narr.night{background:var(--night);color:var(--night-ink)}
+.feed .narr.night .narr-who{color:var(--night-ink);opacity:.7}
+.feed .narr.day{background:#FFF3D6;color:#6B4A00}
+.feed .narr.secret{background:var(--accent-soft);border:1px dashed var(--accent)}
+.feed .narr.good{background:var(--ok-soft);color:var(--ok)}
+.feed .narr.bad{background:#FBE3E0;color:var(--bad)}
+.feed .narr.end,.feed .narr.start{background:var(--ink);color:var(--bg)}
+.feed .narr.end .narr-who,.feed .narr.start .narr-who{color:var(--bg);opacity:.7}
+@media (prefers-color-scheme:dark){.feed .narr.day{background:#3A2F14;color:#F2D58C}.feed .narr.bad{background:#3A1C19}.mf-badge.police{background:#1E2B4A;color:#9DB6F2}}
+@media (max-width:520px){.mf-box{max-height:55%;padding:10px 12px}.mf-p{padding:6px 9px;font-size:13px}}

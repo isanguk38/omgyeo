@@ -292,6 +292,7 @@ function onServer(m) {
     case 'signal': onSignal(m.from, m.data); break;
     case 'waiting': showWaiting(true); break;
     case 'join-request': onJoinRequest(m); break;
+    case 'mafia': if (typeof Mafia !== 'undefined') Mafia.onServer(m); break;   // 마피아 게임 (서버가 사회자)
     case 'join-done': onJoinDone(m); break;
     case 'join-denied': onJoinDenied(m); break;
     case 'error':
@@ -1286,6 +1287,7 @@ function renderHistory(toBottom) {
   }
   for (const r of h.recs.slice(h.recs.length - h.shown)) addFeed(restoreItem(r), true);
   for (const it of live) addFeed(it, true);
+  if (typeof Mafia !== 'undefined') Mafia.replayNotes();   // 지금 게임의 사회자 안내는 기록이 아니라서 다시 붙임
   if (toBottom) nextFrame(scrollBottom);
   else nextFrame(() => { f.scrollTop = f.scrollHeight - fromBottom; });
 }
@@ -1299,6 +1301,7 @@ function showRoom(room) {
   clearFeed();
   S.hist = null;
   S.shownRoom = room;
+  if (typeof Mafia !== 'undefined') Mafia.reset();   // 다른 방으로 가면 게임 판을 치움
   if (room) loadRoomHistory(room);
   if (typeof Sync !== 'undefined' && Sync.setRoom) Sync.setRoom(room);
   if (typeof Album !== 'undefined') Album.load(room);

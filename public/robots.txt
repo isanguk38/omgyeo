@@ -1,5 +1,5 @@
+# 검색 결과에 나오지 않도록 모든 페이지에 noindex를 붙여 두었습니다.
+# 검색 로봇이 그 표시를 읽을 수 있도록 여기서는 막지 않습니다.
 User-agent: *
 Allow: /
 Disallow: /api/
-
-Sitemap: https://omgyeo.onrender.com/sitemap.xml

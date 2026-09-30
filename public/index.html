@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#F3F4F1">
+<meta name="robots" content="noindex, nofollow">
 <title>옮겨</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -182,7 +183,7 @@
 
   <footer class="site-foot">
     <nav aria-label="사이트 정보">
-      <a href="/terms.html">이용 안내</a><a href="/privacy.html"><b>개인정보 처리방침</b></a><a href="https://github.com/isanguk38/omgyeo" target="_blank" rel="noopener">소스 코드</a><a href="https://github.com/isanguk38/omgyeo/issues" target="_blank" rel="noopener">문의</a>
+      <a href="/terms.html">이용 안내</a><a href="/privacy.html"><b>개인정보 처리방침</b></a>
     </nav>
     <p>© 2026 옮겨</p>
   </footer>
@@ -244,11 +245,13 @@
         <button type="button" role="tab" id="tabSync" data-tab="sync" aria-selected="false" aria-controls="paneSync" hidden>폴더 동기화<span class="tbadge" id="syncBadge" hidden></span></button>
         <div class="tab-tools" id="chatTools">
           <button type="button" class="link" id="saveAllBtn" hidden>받은 파일 모두 저장</button>
+          <button type="button" class="link mafia-btn" id="mafiaBtn" title="연결된 기기들과 마피아 게임하기 (4명 이상)">마피아 게임</button>
           <button type="button" class="link muted" id="clearHistBtn">기록 지우기</button>
         </div>
       </div>
 
       <div class="tabpane chat" id="paneChat" role="tabpanel" aria-labelledby="tabChat">
+        <section class="mf-box" id="mafiaBox" aria-label="마피아 게임" hidden></section>
         <div class="chat-body">
           <ul class="feed" id="feed"></ul>
           <div class="feed-empty" id="feedEmpty">
@@ -467,5 +470,6 @@
 <script src="/app.js"></script>
 <script src="/sync.js"></script>
 <script src="/album.js"></script>
+<script src="/mafia.js"></script>
 </body>
 </html>

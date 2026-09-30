@@ -83,6 +83,8 @@ async function ngrokUrl() {
 // ---------- HTTP ----------
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
+  // 검색 결과에 나오지 않게 함 (주소를 아는 사람만 들어오도록). 모든 응답에 붙임
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
 
   if (url.pathname === '/api/info') {
     const proto = req.socket.encrypted ? 'https' : 'http';
@@ -146,6 +148,7 @@ function newCode() {
 // caps: 기기 능력(fs: 폴더 읽고 쓰기 가능, pid: 브라우저 고유 표식 — 폴더 동기화 짝·신뢰 기기 기억용)
 const info = ws => ({ id: ws.id, name: ws.name, kind: ws.kind, pub: ws.pub, dev: ws.dev, caps: ws.caps });
 const sendJSON = (ws, obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
+const Mafia = require('./mafia')(sendJSON);
 
 // ---------- 코드 무작위 대입 막기: 같은 곳에서 10분 안에 10번 틀리면 10분 동안 코드 입장 차단 ----------
 const FAIL_WINDOW = 10 * 60e3, FAIL_MAX = 10, BLOCK_FOR = 10 * 60e3;
@@ -224,6 +227,7 @@ function admit(ws, roomId, remember = true) {
   if (remember && ws.caps && ws.caps.pid) room.known.add(ws.caps.pid);
   ws.room = roomId;
   sendJSON(ws, { type: 'joined', room: roomId, code: room.code, you: ws.id, peers });
+  Mafia.onJoin(room, ws);   // 게임 중이면 지금 상황을 보여 줌 (구경)
 }
 
 function leave(ws) {
@@ -231,9 +235,11 @@ function leave(ws) {
   if (!room) { ws.room = null; return; }
   room.peers.delete(ws.id);
   for (const other of room.peers.values()) sendJSON(other, { type: 'peer-left', id: ws.id });
+  Mafia.onLeave(room, ws);
   if (room.peers.size === 0) {
     // 허용해 줄 기기가 모두 나가면 기다리던 요청은 거절
     for (const [reqId] of room.pending) answer(ws.room, reqId, false, 'empty');
+    Mafia.stop(room);
     codes.delete(room.code); rooms.delete(ws.room);
   }
   ws.room = null;
@@ -312,6 +318,9 @@ wss.on('connection', (ws, req) => {
       case 'leave':
         cancelPending(ws);
         leave(ws);
+        break;
+      case 'mafia':   // 마피아 게임 (서버가 사회자)
+        if (ws.room) Mafia.onMsg(rooms.get(ws.room), ws, m);
         break;
       case 'rename': {
         ws.name = String(m.name || '기기').slice(0, 30);
