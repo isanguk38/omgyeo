@@ -24,13 +24,15 @@ const Sync = {
 // ---------- 시작 ----------
 Sync.init = async () => {
   if (!FS_OK) {
-    if (IS_MOBILE) return;   // 폰은 폴더 동기화를 지원하지 않아 영역 자체를 숨김
+    if (IS_MOBILE) return;   // 폰은 폴더 동기화를 지원하지 않아 탭 자체를 숨김
+    $('#tabSync').hidden = false;
     $('#syncBox').hidden = false;
     $('#syncBox').innerHTML = `<div class="sync-head"><h2>폴더 동기화</h2></div><p class="sync-note">${globalThis.isSecureContext
       ? '폴더 동기화와 바로 저장은 크롬이나 엣지 브라우저에서만 돼요.'
       : '폴더 동기화와 바로 저장은 https 주소에서만 켜져요. 배포 주소나 localhost로 열어 주세요.'}</p>`;
     return;
   }
+  $('#tabSync').hidden = false;
   $('#syncBox').hidden = false;
   const saved = await idb.get('kv', 'share');
   if (saved && saved.handle) {
@@ -562,8 +564,21 @@ function drawSync() {
   }
   // 입력 중인 제외 규칙은 다시 그리지 않음
   const ta = document.activeElement && document.activeElement.id === 'ignoreText';
-  if (ta) return;
+  if (ta) return syncBadge();
   box.innerHTML = html;
+  syncBadge();
+}
+// 탭 배지: 보낼 변경이 있는 기기 수 + 받을 위치를 골라야 하는 요청 수
+function syncBadge() {
+  let n = 0;
+  for (const s of Sync.sessions.values()) if (s.state === 'ready' && hasWork(s)) n++;
+  let ask = 0;
+  for (const s of Sync.inbound.values()) if (s.state === 'ask' || s.state === 'perm') ask++;
+  const el = $('#syncBadge');
+  el.hidden = !(n + ask);
+  el.textContent = ask ? '!' : String(n);
+  el.classList.toggle('alert', !!ask);
+  el.title = ask ? '폴더 공유 요청이 있어요' : `보낼 변경이 있는 기기 ${n}대`;
 }
 function peerRow(sess) {
   const d = sess.diff;

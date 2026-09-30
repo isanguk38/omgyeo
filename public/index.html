@@ -59,9 +59,14 @@
   </section>
 </main>
 
-<!-- 연결 후 -->
+<!-- 연결 후: 한 화면 고정. 왼쪽 사이드바(연결·기기·저장 위치), 오른쪽 탭(대화 | 폴더 동기화) -->
 <main id="room" class="room" hidden>
-  <aside class="side">
+  <button type="button" class="side-toggle" id="sideToggle" aria-expanded="false" aria-controls="side">
+    <span class="st-dot" aria-hidden="true"></span><span id="sideSummary">연결 정보</span>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+  </button>
+
+  <aside class="side" id="side">
     <section class="pair" id="pairBox">
       <div class="pair-head">
         <h2 id="pairTitle">다른 기기를 연결하세요</h2>
@@ -84,50 +89,56 @@
       <p class="sec-hint" id="secHint" hidden></p>
     </section>
 
+    <section class="dlrow" id="dlRow" hidden>
+      <h2>받은 파일 저장</h2>
+      <span id="dlText"></span>
+      <div class="dlbtns" id="dlBtns"></div>
+    </section>
+
     <button type="button" class="leave" id="leaveBtn">연결 끊고 나가기</button>
   </aside>
 
   <section class="main">
     <div class="targets" id="targets" hidden></div>
 
-    <label class="drop" id="drop" for="fileInput">
-      <input type="file" id="fileInput" multiple hidden>
-      <span class="drop-ic" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg>
-      </span>
-      <strong id="dropTitle">보낼 파일 고르기</strong>
-      <span class="drop-sub" id="dropSub">사진, 동영상, 문서 무엇이든 · 여러 개 한 번에</span>
-    </label>
-    <div class="pick-row">
-      <button type="button" class="pick" id="folderBtn">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/></svg>
-        폴더째 보내기
-      </button>
-      <input type="file" id="folderInput" webkitdirectory multiple hidden>
-    </div>
-    <section class="chat" aria-label="주고받은 것">
-      <div class="chat-head">
-        <h2>주고받은 것</h2>
-        <div class="chat-tools">
+    <div class="panel">
+      <div class="tabs" role="tablist" aria-label="보기">
+        <button type="button" role="tab" id="tabChat" data-tab="chat" aria-selected="true" aria-controls="paneChat">대화</button>
+        <button type="button" role="tab" id="tabSync" data-tab="sync" aria-selected="false" aria-controls="paneSync" hidden>폴더 동기화<span class="tbadge" id="syncBadge" hidden></span></button>
+        <div class="tab-tools" id="chatTools">
           <button type="button" class="link" id="saveAllBtn" hidden>받은 파일 모두 저장</button>
           <button type="button" class="link muted" id="clearHistBtn">기록 지우기</button>
         </div>
       </div>
-      <div class="chat-body">
-        <ul class="feed" id="feed"></ul>
-        <p class="feed-empty" id="feedEmpty">보내거나 받은 파일과 글이 여기에 대화처럼 쌓여요.<br>이 연결의 기록은 이 브라우저에 저장돼서, 나중에 "다시 연결"하면 다시 보여요.</p>
-        <button type="button" class="newmsg" id="newMsg" hidden>새 메시지 ↓</button>
+
+      <div class="tabpane chat" id="paneChat" role="tabpanel" aria-labelledby="tabChat">
+        <div class="chat-body">
+          <ul class="feed" id="feed"></ul>
+          <div class="feed-empty" id="feedEmpty">
+            <span class="fe-ic" aria-hidden="true"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg></span>
+            <b id="emptyTitle">파일을 여기로 끌어다 놓거나 ＋를 눌러 보내세요</b>
+            <span>주고받은 파일과 글은 대화처럼 쌓이고, 이 연결의 기록은 이 브라우저에 저장돼요.</span>
+          </div>
+          <button type="button" class="newmsg" id="newMsg" hidden>새 메시지 ↓</button>
+        </div>
+        <form class="textsend composer" id="textForm">
+          <label class="icon-btn" id="drop" for="fileInput" title="파일 보내기" aria-label="파일 보내기">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </label>
+          <input type="file" id="fileInput" multiple hidden>
+          <button type="button" class="icon-btn" id="folderBtn" title="폴더째 보내기" aria-label="폴더째 보내기">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/></svg>
+          </button>
+          <input type="file" id="folderInput" webkitdirectory multiple hidden>
+          <textarea id="textInput" rows="1" placeholder="글, 링크, 계좌번호 보내기" aria-label="보낼 글"></textarea>
+          <button type="submit" class="send">보내기</button>
+        </form>
       </div>
-      <form class="textsend" id="textForm">
-        <textarea id="textInput" rows="1" placeholder="글, 링크, 계좌번호 보내기" aria-label="보낼 글"></textarea>
-        <button type="submit">보내기</button>
-      </form>
-    </section>
-    <div class="dlrow" id="dlRow" hidden><span id="dlText"></span><div class="dlbtns" id="dlBtns"></div></div>
 
-
-    <section class="sync" id="syncBox" hidden></section>
-
+      <div class="tabpane" id="paneSync" role="tabpanel" aria-labelledby="tabSync" hidden>
+        <section class="sync" id="syncBox" hidden></section>
+      </div>
+    </div>
   </section>
 </main>
 

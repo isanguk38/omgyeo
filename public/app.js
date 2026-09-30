@@ -736,6 +736,7 @@ async function saveBundleZip(b) {
 
 // ---------- 화면: 공통 ----------
 function show(which) {
+  document.body.classList.toggle('in-room', which === 'room');
   $('#home').hidden = which !== 'home';
   $('#room').hidden = which !== 'room';
   if (which === 'home') renderRecent();
@@ -866,8 +867,17 @@ function renderPeers() {
   const none = peers.length === 0;
   $('#drop').classList.toggle('disabled', none);
   $('#folderBtn').disabled = none;
-  $('#dropTitle').textContent = none ? '연결된 기기가 없어요' : IS_MOBILE ? '보낼 파일 고르기' : '파일이나 폴더를 끌어다 놓거나 눌러서 고르기';
-  $('#dropSub').textContent = none ? 'QR이나 코드로 다른 기기를 먼저 연결하세요' : `${peers.length === 1 ? peers[0].name + '(으)로' : '고른 기기로'} 원본 그대로 보냅니다`;
+  $('#emptyTitle').textContent = none ? '먼저 다른 기기를 연결하세요 · QR이나 6자리 코드로 연결해요'
+    : IS_MOBILE ? '＋를 눌러 파일을 보내거나 아래에 글을 입력하세요' : '파일이나 폴더를 여기로 끌어다 놓거나 ＋를 눌러 보내세요';
+  const narrow = matchMedia('(max-width: 520px)').matches;
+  $('#textInput').placeholder = none ? (narrow ? '기기를 먼저 연결하세요' : '기기를 연결하면 글을 보낼 수 있어요')
+    : narrow ? '메시지 보내기' : `${peers.length === 1 ? peers[0].name : '연결된 기기'}에 글, 링크, 계좌번호 보내기`;
+  // 폰: 연결 정보는 위쪽 버튼으로 펼침. 기기가 없으면 펼치고, 처음 연결되면 접어서 대화창이 화면을 채우게
+  $('#sideSummary').textContent = none ? '연결 정보 · QR로 기기 연결하기' : `${peers.map(p => p.name).join(', ')} 연결됨`;
+  $('#sideToggle').classList.toggle('on', !none);
+  if (none && !S.sideTouched) setSide(true);
+  else if (!none && S.lastPeerCount === 0 && !S.sideTouched) setSide(false);
+  S.lastPeerCount = peers.length;
   renderPair();
 }
 $('#targets').addEventListener('click', e => {
@@ -1487,6 +1497,24 @@ $('#dlBtns').addEventListener('click', async e => {
   }
   renderDl();
 });
+
+// ---------- 탭(대화 | 폴더 동기화), 폰의 연결 정보 펼치기 ----------
+function selectTab(name) {
+  for (const t of document.querySelectorAll('.tabs [role=tab]')) t.setAttribute('aria-selected', String(t.dataset.tab === name));
+  $('#paneChat').hidden = name !== 'chat';
+  $('#paneSync').hidden = name !== 'sync';
+  $('#chatTools').hidden = name !== 'chat';
+  if (name === 'chat' && stick) nextFrame(scrollBottom);
+}
+document.querySelector('.tabs').addEventListener('click', e => { const t = e.target.closest('[role=tab]'); if (t) selectTab(t.dataset.tab); });
+function setSide(open) {
+  document.body.classList.toggle('side-open', open);
+  $('#sideToggle').setAttribute('aria-expanded', String(open));
+}
+S.lastPeerCount = 0;
+let resizeTimer;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (S.room) renderPeers(); }, 200); });
+$('#sideToggle').onclick = () => { S.sideTouched = true; setSide(!document.body.classList.contains('side-open')); };
 
 // ---------- 시작 ----------
 (async function start() {
