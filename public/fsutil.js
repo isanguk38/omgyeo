@@ -10,8 +10,14 @@ const FS_OK = typeof window.showDirectoryPicker === 'function' && !!globalThis.i
 const idb = (() => {
   let dbp = null;
   const open = () => dbp || (dbp = new Promise((resolve, reject) => {
-    const r = indexedDB.open('omgyeo', 1);
-    r.onupgradeneeded = () => { r.result.createObjectStore('kv'); r.result.createObjectStore('hash'); };
+    const r = indexedDB.open('omgyeo', 2);
+    r.onupgradeneeded = () => {
+      const db = r.result;
+      if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+      if (!db.objectStoreNames.contains('hash')) db.createObjectStore('hash');
+      // 연결(방)별 대화·파일 기록
+      if (!db.objectStoreNames.contains('msgs')) db.createObjectStore('msgs', { keyPath: 'id' }).createIndex('room', 'room');
+    };
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
   }));
@@ -28,6 +34,24 @@ const idb = (() => {
     get: (store, key) => run(store, 'readonly', s => s.get(key)).catch(() => undefined),
     set: (store, key, val) => run(store, 'readwrite', s => { s.put(val, key); }).catch(err => console.warn('idb', err)),
     del: (store, key) => run(store, 'readwrite', s => { s.delete(key); }).catch(() => {}),
+    msgPut: rec => run('msgs', 'readwrite', s => { s.put(rec); }).catch(err => console.warn('idb msg', err)),
+    msgList: room => run('msgs', 'readonly', s => s.index('room').getAll(room)).catch(() => []),
+    async msgDelRoom(room) {
+      const db = await open();
+      return new Promise(resolve => {
+        const t = db.transaction('msgs', 'readwrite');
+        const req = t.objectStore('msgs').index('room').openKeyCursor(IDBKeyRange.only(room));
+        req.onsuccess = () => { const c = req.result; if (c) { t.objectStore('msgs').delete(c.primaryKey); c.continue(); } };
+        t.oncomplete = () => resolve(); t.onerror = () => resolve();
+      });
+    },
+    async msgCount(room) {
+      const db = await open();
+      return new Promise(resolve => {
+        const req = db.transaction('msgs', 'readonly').objectStore('msgs').index('room').count(room);
+        req.onsuccess = () => resolve(req.result); req.onerror = () => resolve(0);
+      });
+    },
   };
 })();
 

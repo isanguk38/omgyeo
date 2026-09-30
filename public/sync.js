@@ -489,8 +489,7 @@ let syncQueued = false;
 function syncRender() {
   if (syncQueued || !FS_OK) return;
   syncQueued = true;
-  const next = document.hidden ? cb => setTimeout(cb, 300) : requestAnimationFrame;
-  next(() => { syncQueued = false; drawSync(); });
+  nextFrame(() => { syncQueued = false; drawSync(); });
 }
 function drawSync() {
   const box = $('#syncBox');

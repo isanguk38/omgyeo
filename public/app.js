@@ -41,6 +41,13 @@ function concat(...arrs) {
   return out;
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 다음 화면 갱신 때 실행. 창이 가려지거나 최소화되면 requestAnimationFrame이 멈추므로 타이머로도 보장
+function nextFrame(cb) {
+  let done = false;
+  const run = () => { if (!done) { done = true; cb(); } };
+  requestAnimationFrame(run);
+  setTimeout(run, 120);
+}
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 function fmtSize(n) {
   if (n < 1024) return `${n}B`;
@@ -219,6 +226,7 @@ function onServer(m) {
       S.want = { room: m.room };
       store.set('omgyeo.last', m.room);
       if (location.search) history.replaceState(null, '', location.pathname);
+      showRoom(m.room);
       for (const p of m.peers) addPeer(p, true);
       remember();
       show('room');
@@ -410,7 +418,7 @@ function onCtrl(p, m) {
       return;
     }
     case 'text':
-      addFeed({ kind: 'text', dir: 'in', text: String(m.text), peerName: p.name, time: Date.now() });
+      { const it = { kind: 'text', dir: 'in', text: String(m.text), peerName: p.name, time: Date.now() }; addFeed(it); persistItem(it); }
       toast(`${p.name}에서 글이 왔어요`);
       announce(`${p.name}에서 글이 왔어요`, String(m.text).slice(0, 120));
       return;
@@ -498,7 +506,7 @@ async function sendJob(p, job) {
       bid: job.bid, bname: job.bname, bcount: job.bcount, btotal: job.btotal,
     }, how);
     const from = await replyP;
-    if (from < 0) { p.waiters.delete(ackKey); job.done = job.size; job.state = 'done'; return scheduleFeed(); }
+    if (from < 0) { p.waiters.delete(ackKey); job.done = job.size; job.state = 'done'; onOutDone(job); return scheduleFeed(); }
     if (from > 0 && from < job.size) job.resumed = from;
     job.state = 'sending'; job.done = from; job.start = performance.now(); job.startDone = from;
     scheduleFeed();
@@ -519,6 +527,7 @@ async function sendJob(p, job) {
     job.state = 'wait'; scheduleFeed();
     await Promise.race([ackP, sleep(90000).then(() => { throw new Error('ack timeout'); })]);
     job.state = 'done';
+    onOutDone(job);
   } catch (err) {
     if (job.state !== 'cancelled' && job.state !== 'done') job.state = 'paused';
     p.waiters.delete(ackKey); p.waiters.delete(resumeKey);
@@ -529,7 +538,9 @@ function sendText(text) {
   const targets = targetPeers();
   if (!targets.length) return toast('먼저 받을 기기를 연결하세요.');
   for (const p of targets) sendCtrl(p, { t: 'text', text }).catch(() => toast(`${p.name}에 보내지 못했어요`));
-  addFeed({ kind: 'text', dir: 'out', text, peerName: targets.map(p => p.name).join(', '), time: Date.now() });
+  const it = { kind: 'text', dir: 'out', text, peerName: targets.map(p => p.name).join(', '), time: Date.now() };
+  addFeed(it);
+  persistItem(it);
 }
 
 // ---------- 받기 ----------
@@ -645,10 +656,13 @@ async function finishIncoming(p, inc) {
   if (inc.bundle) {
     const b = inc.bundle;
     if (b.files.length === b.count && b.files.every(f => f.state === 'done')) {
+      bundleState(b);
+      persistItem(b);
       toast(`${b.name} 폴더 받음 (파일 ${b.count}개)`);
       announce(`${p.name}에서 폴더를 보냈어요`, `${b.name} · 파일 ${b.count}개`);
     }
   } else {
+    persistItem(inc);
     toast(inc.onDisk ? `${inc.name} 받아서 저장함` : `${inc.name} 받음`);
     announce(`${p.name}에서 파일을 보냈어요`, `${inc.name} · ${fmtSize(inc.size)}`);
   }
@@ -736,15 +750,24 @@ function renderRecent() {
   const list = store.get('omgyeo.recent', []).filter(r => r.names.length);
   $('#recentBox').hidden = !list.length;
   $('#recentList').innerHTML = list.map(r => `
-    <li><div class="rn"><b>${esc(r.names.join(', '))}</b><small>${ago(r.ts)}</small></div>
+    <li><div class="rn"><b>${esc(r.names.join(', '))}</b><small>${ago(r.ts)}<span data-count="${esc(r.room)}"></span></small></div>
     <button type="button" data-rejoin="${esc(r.room)}">다시 연결</button>
-    <button type="button" class="x" data-forget="${esc(r.room)}" aria-label="목록에서 지우기">✕</button></li>`).join('');
+    <button type="button" class="x" data-forget="${esc(r.room)}" aria-label="연결과 기록 지우기" title="연결과 기록 지우기">✕</button></li>`).join('');
+  for (const r of list) idb.msgList(r.room).then(recs => recs.filter(x => !x.owner || x.owner === PERSIST_ID).length).then(n => {
+    const el = document.querySelector(`[data-count="${r.room}"]`);
+    if (el && n) el.textContent = ` · 기록 ${n}개`;
+  });
 }
 $('#recentList').addEventListener('click', e => {
   const r = e.target.closest('[data-rejoin]');
   if (r) { S.want = { room: r.dataset.rejoin }; sendServer({ type: 'join', room: r.dataset.rejoin }); return; }
   const f = e.target.closest('[data-forget]');
-  if (f) { store.set('omgyeo.recent', store.get('omgyeo.recent', []).filter(x => x.room !== f.dataset.forget)); renderRecent(); }
+  if (f) {
+    idb.msgDelRoom(f.dataset.forget);
+    store.set('omgyeo.recent', store.get('omgyeo.recent', []).filter(x => x.room !== f.dataset.forget));
+    renderRecent();
+    toast('연결과 기록을 지웠어요');
+  }
 });
 $('#createBtn').onclick = async () => { await loadInfo(); S.want = 'create'; sendServer({ type: 'create' }); };
 $('#codeForm').onsubmit = e => {
@@ -858,39 +881,165 @@ $('#leaveBtn').onclick = () => {
   for (const p of list) closePeer(p);
   S.parked = [];
   S.room = null; S.want = null;
+  showRoom(null);
   store.del('omgyeo.last');
   show('home');
 };
 
-// ---------- 화면: 주고받은 목록 ----------
-function addFeed(item) {
-  S.feed.unshift(item);
+// ---------- 화면: 대화창 (채팅 형식) ----------
+const WEEK = ['일', '월', '화', '수', '목', '금', '토'];
+const hhmm = t => { const d = new Date(t); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+const dayLabel = t => { const d = new Date(t); return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${WEEK[d.getDay()]}요일`; };
+const dayKey = t => new Date(t).toDateString();
+const feedBox = () => $('#feed');
+let stick = true;   // 맨 아래를 보고 있으면 새 메시지가 올 때 따라 내려감
+function nearBottom() { const f = feedBox(); return f.scrollHeight - f.scrollTop - f.clientHeight < 80; }
+function scrollBottom() { const f = feedBox(); f.scrollTop = f.scrollHeight; $('#newMsg').hidden = true; stick = true; }
+feedBox().addEventListener('scroll', () => { stick = nearBottom(); if (stick) $('#newMsg').hidden = true; });
+$('#newMsg').onclick = scrollBottom;
+
+function addFeed(item, restoring) {
+  item.time = item.time || Date.now();
+  if (!item.room) item.room = S.room;
+  const wasBottom = stick || nearBottom();
+  S.feed.push(item);
+  if (S.lastDay !== dayKey(item.time)) {
+    S.lastDay = dayKey(item.time);
+    const sep = document.createElement('li');
+    sep.className = 'day';
+    sep.textContent = dayLabel(item.time);
+    feedBox().appendChild(sep);
+  }
   const li = document.createElement('li');
   item.el = li;
-  $('#feed').prepend(li);
+  feedBox().appendChild(li);
   buildItem(item);
   $('#feedEmpty').hidden = true;
   scheduleFeed();
+  if (restoring) return;
+  if (wasBottom || item.dir === 'out') nextFrame(scrollBottom);
+  else $('#newMsg').hidden = false;
+}
+function clearFeed() {
+  for (const it of S.feed) { if (it.restored && it.url) URL.revokeObjectURL(it.url); }
+  S.feed = [];
+  S.lastDay = null;
+  feedBox().innerHTML = '';
+  $('#feedEmpty').hidden = false;
+  $('#newMsg').hidden = true;
 }
 function buildItem(it) {
   const li = it.el;
-  li.className = `fi ${it.dir} ${it.kind}`;
-  const arrow = it.dir === 'in' ? `<span class="dir in">← ${esc(it.peerName)}</span>` : `<span class="dir out">→ ${esc(it.peerName)}</span>`;
+  li.className = `msg ${it.dir} ${it.kind}`;
+  const who = it.dir === 'in' ? esc(it.peerName) : `→ ${esc(it.peerName)}`;
   if (it.kind === 'text') {
-    li.innerHTML = `<div class="th">글</div>
-      <div class="body"><div class="txt"></div><div class="meta">${arrow}</div></div>
-      <div class="act">${it.dir === 'in' ? '<button type="button" class="solid" data-a="copy">복사</button>' : '<span class="st done">보냄</span>'}</div>`;
+    const isUrl = /^https?:\/\/\S+$/.test(it.text.trim());
+    li.innerHTML = `<div class="who">${who}</div>
+      <div class="row"><div class="bubble"><div class="txt"></div>
+        <div class="act">${isUrl ? '<button type="button" data-a="open">열기</button>' : ''}<button type="button" data-a="copy">복사</button></div></div>
+      <span class="time">${hhmm(it.time)}</span></div>`;
     li.querySelector('.txt').textContent = it.text;
-    if (it.dir === 'in' && /^https?:\/\/\S+$/.test(it.text.trim())) li.querySelector('.act').insertAdjacentHTML('afterbegin', '<button type="button" data-a="open">열기</button>');
     return;
   }
-  li.innerHTML = `<div class="th"></div>
-    <div class="body"><div class="nm"></div><div class="meta">${arrow}<span class="sz"></span></div><div class="bar"><i></i></div></div>
-    <div class="act"></div>`;
+  li.innerHTML = `<div class="who">${who}</div>
+    <div class="row"><div class="bubble">
+      <div class="fcard"><div class="th"></div>
+        <div class="body"><div class="nm"></div><div class="meta"><span class="sz"></span></div><div class="bar"><i></i></div></div></div>
+      <div class="act"></div></div>
+    <span class="time">${hhmm(it.time)}</span></div>`;
   li.querySelector('.nm').textContent = it.kind === 'bundle' ? `${it.name}/` : it.name;
-  it.refs = { th: li.querySelector('.th'), sz: li.querySelector('.sz'), bar: li.querySelector('.bar'), fill: li.querySelector('.bar i'), act: li.querySelector('.act') };
+  it.refs = { card: li.querySelector('.fcard'), th: li.querySelector('.th'), sz: li.querySelector('.sz'), bar: li.querySelector('.bar'), fill: li.querySelector('.bar i'), act: li.querySelector('.act') };
   it.shown = {};
 }
+
+// ---------- 연결(방)별 기록: 이 브라우저의 IndexedDB에만 저장 ----------
+const SAVE_MAX = 200 * 1024 * 1024;   // 파일 내용은 항목당 200MB까지만 보관 (넘으면 기록만)
+async function persistItem(it) {
+  if (!it || it.persisted || !it.room) return;
+  it.persisted = true;
+  const rec = { id: randStr(14), room: it.room, owner: PERSIST_ID, time: it.time, kind: it.kind, dir: it.dir, peerName: it.peerName };
+  if (it.kind === 'text') rec.text = it.text;
+  else if (it.kind === 'file') {
+    Object.assign(rec, { name: it.name, size: it.size, mime: it.mime, onDisk: !!it.onDisk });
+    const blob = it.dir === 'out' ? it.file : it.blob;
+    if (it.fh) rec.fh = it.fh;
+    else if (blob && it.size <= SAVE_MAX) rec.blob = blob;
+    else rec.noData = true;
+  } else if (it.kind === 'bundle') {
+    let total = 0;
+    const list = (it.dir === 'out' ? it.jobs : it.files).filter(f => f.state === 'done');
+    Object.assign(rec, { name: it.name, count: list.length, size: it.size, diskName: it.diskName || null });
+    rec.files = list.map(f => {
+      const o = { path: f.path || f.name, name: f.name, size: f.size, mime: f.mime, crc: f.crc || 0 };
+      const blob = f.dir === 'out' ? f.file : f.blob;
+      if (f.fh) o.fh = f.fh;
+      else if (blob && total + f.size <= SAVE_MAX) { o.blob = blob; total += f.size; }
+      return o;
+    });
+  }
+  await idb.msgPut(rec);
+  persistStorage();
+}
+// 보낸 파일은 상대가 다 받았다고 확인하면 기록
+function onOutDone(job) {
+  if (job.bundle) {
+    const list = job.bundle.jobs;
+    if (list.every(j => ['done', 'failed', 'cancelled'].includes(j.state)) && list.some(j => j.state === 'done')) persistItem(job.bundle);
+  } else persistItem(job);
+}
+function restoreItem(r) {
+  const base = { persisted: true, restored: true, room: r.room, time: r.time, dir: r.dir, peerName: r.peerName, kind: r.kind };
+  if (r.kind === 'text') return { ...base, text: r.text };
+  if (r.kind === 'file') {
+    const it = { ...base, name: r.name, size: r.size, mime: r.mime || '', done: r.size, state: 'done', onDisk: r.onDisk, fh: r.fh };
+    if (r.blob) {
+      if (r.dir === 'out') it.file = r.blob;
+      else { it.blob = r.blob; it.url = URL.createObjectURL(r.blob); }
+      if (it.mime.startsWith('image/')) it.thumb = it.url || URL.createObjectURL(r.blob);
+    } else if (r.fh) {
+      it.saved = true;
+      r.fh.getFile().then(f => {   // 바로 저장 폴더에 있는 파일
+        it.blob = f; it.url = URL.createObjectURL(f);
+        if (it.mime.startsWith('image/')) it.thumb = it.url;
+        it.shown = {}; scheduleFeed();
+      }).catch(() => { it.gone = 'disk'; it.shown = {}; scheduleFeed(); });
+    } else it.gone = 'big';
+    return it;
+  }
+  const files = (r.files || []).map(f => ({ ...f, dir: r.dir, state: 'done', done: f.size, onDisk: !!f.fh }));
+  const it = { ...base, name: r.name, count: files.length, size: r.size, total: r.size, done: r.size, state: 'done', diskName: r.diskName, files, jobs: files };
+  if (files.some(f => !f.blob && !f.fh)) it.partial = true;
+  return it;
+}
+async function loadRoomHistory(room) {
+  const recs = (await idb.msgList(room)).filter(r => !r.owner || r.owner === PERSIST_ID);   // 같은 브라우저의 다른 탭 기록은 제외
+  if (S.shownRoom !== room) return;
+  recs.sort((a, b) => a.time - b.time);
+  for (const r of recs) addFeed(restoreItem(r), true);
+  nextFrame(scrollBottom);
+}
+function showRoom(room) {
+  if (S.shownRoom === room) return;
+  clearFeed();
+  S.shownRoom = room;
+  if (room) loadRoomHistory(room);
+}
+$('#clearHistBtn').onclick = async () => {
+  const b = $('#clearHistBtn');
+  if (b.dataset.armed !== '1') {
+    b.dataset.armed = '1'; b.textContent = '한 번 더 누르면 지워요';
+    setTimeout(() => { b.dataset.armed = ''; b.textContent = '기록 지우기'; }, 3000);
+    return;
+  }
+  b.dataset.armed = ''; b.textContent = '기록 지우기';
+  if (!S.room) return;
+  await idb.msgDelRoom(S.room);
+  const keep = S.feed.filter(it => !['done', 'failed', 'cancelled'].includes(it.state) && it.kind !== 'text');
+  clearFeed();
+  for (const it of keep) addFeed(it, true);
+  toast('이 연결의 대화와 파일 기록을 지웠어요');
+};
+
 // 폴더는 안의 파일들 상태를 모아서 하나로 보여 줌
 function bundleState(b) {
   const list = b.dir === 'out' ? b.jobs : b.files;
@@ -919,7 +1068,11 @@ function updateItem(it) {
   if (it.kind === 'bundle') bundleState(it);
   const r = it.refs;
   if (it.kind === 'bundle') { if (!it.shown.thumb) { r.th.innerHTML = ICONS.folder; it.shown.thumb = 1; } }
-  else if (it.thumb && it.shown.thumb !== it.thumb) { r.th.innerHTML = `<img alt="" src="${it.thumb}">`; it.shown.thumb = it.thumb; }
+  else if (it.thumb && it.shown.thumb !== it.thumb) {
+    r.th.innerHTML = `<img alt="" src="${it.thumb}">`; it.shown.thumb = it.thumb;
+    r.card.classList.add('has-img');
+    r.th.querySelector('img').onload = () => { if (stick) scrollBottom(); };
+  }
   else if (!it.thumb && !it.shown.thumb) { r.th.textContent = extOf(it.name); it.shown.thumb = '-'; }
 
   r.th.classList.toggle('zoom', isMedia(it));
@@ -934,11 +1087,11 @@ function updateItem(it) {
     if (it.kind === 'bundle') sz = `${it.doneCount}/${it.count}개 · ${sz}`;
   } else if (it.state === 'paused' && it.size) sz = `${Math.floor(pct)}%에서 멈춤 · ${fmtSize(it.size)}`;
   if (it.resumed && it.state !== 'done') sz += it.dir === 'out' ? ' · 이어서 보내는 중' : ' · 이어받는 중';
-  if (it.shown.sz !== sz) { r.sz.textContent = `· ${sz}`; it.shown.sz = sz; }
+  if (it.shown.sz !== sz) { r.sz.textContent = sz; it.shown.sz = sz; }
   r.bar.hidden = !['sending', 'receiving', 'queued', 'wait', 'paused'].includes(it.state);
   r.bar.classList.toggle('paused', it.state === 'paused');
 
-  const key = `${it.state}:${it.saved ? 1 : 0}`;
+  const key = `${it.state}:${it.saved ? 1 : 0}:${it.gone || ''}:${it.blob ? 1 : 0}`;
   if (it.shown.act === key) return;
   it.shown.act = key;
   const L = {
@@ -950,16 +1103,22 @@ function updateItem(it) {
     failed: '<span class="st fail">실패</span>',
     cancelled: '<span class="st fail">취소됨</span>',
   };
-  if (it.state === 'done') {
+  if (it.state === 'done' && it.gone) {
+    r.act.innerHTML = it.gone === 'big' ? '<span class="st">기록만 남음 · 파일이 커서 내용은 보관하지 않았어요</span>'
+      : '<span class="st">저장 폴더에서 파일을 찾지 못했어요</span>';
+  } else if (it.state === 'done') {
     if (it.dir === 'out') r.act.innerHTML = '<span class="st done">전달 완료</span>';
     else if (it.kind === 'bundle' && it.files.every(f => f.onDisk)) {
       r.act.innerHTML = `<span class="st done">'${esc(it.diskName || it.name)}' 폴더에 저장됨</span>`;
+    } else if (it.kind === 'bundle' && it.partial) {
+      r.act.innerHTML = '<span class="st">기록만 남음 · 폴더가 커서 일부 내용은 보관하지 않았어요</span>';
     } else if (it.kind === 'bundle') {
       const zipOk = it.size < ZIP_LIMIT && it.count < 65535;
       r.act.innerHTML = (zipOk ? `<button type="button" class="${it.saved ? '' : 'solid'}" data-a="zip">${it.saved ? 'zip 다시 저장' : 'zip으로 저장'}</button>` : '') +
         `<button type="button" class="${zipOk ? '' : 'solid'}" data-a="each">파일 각각 저장</button>`;
     } else {
       const viewable = /^(image|video|audio|text)\/|pdf$/.test(it.mime);
+      if (!it.blob) { r.act.innerHTML = '<span class="st">불러오는 중…</span>'; return; }
       r.act.innerHTML = (viewable && !IS_MOBILE ? '<button type="button" data-a="view">열기</button>' : '') +
         `<button type="button" class="${it.saved ? '' : 'solid'}" data-a="save">${it.saved ? '다시 저장' : '저장'}</button>`;
     }
@@ -969,9 +1128,7 @@ let feedQueued = false;
 function scheduleFeed() {
   if (feedQueued) return;
   feedQueued = true;
-  // 백그라운드 탭에서는 requestAnimationFrame이 멈추므로 타이머로 대신 갱신
-  const next = document.hidden ? cb => setTimeout(cb, 250) : requestAnimationFrame;
-  next(() => {
+  nextFrame(() => {
     feedQueued = false;
     for (const it of S.feed) updateItem(it);
     const unsaved = S.feed.filter(it => it.dir === 'in' && it.kind === 'file' && it.state === 'done' && !it.saved);
@@ -1011,7 +1168,7 @@ $('#feed').addEventListener('click', async e => {
   else if (a === 'open') window.open(it.text.trim(), '_blank', 'noopener');
 });
 $('#saveAllBtn').onclick = async () => {
-  const list = S.feed.filter(it => it.dir === 'in' && it.kind === 'file' && it.state === 'done' && !it.saved).reverse();
+  const list = S.feed.filter(it => it.dir === 'in' && it.kind === 'file' && it.state === 'done' && !it.saved && it.blob);
   if (await saveBlobs(list)) { for (const it of list) it.saved = true; scheduleFeed(); }
 };
 
@@ -1128,14 +1285,14 @@ $('#bellBtn').onclick = async () => {
 
 // ---------- 사진·영상 크게 보기 ----------
 const V = { list: [], i: 0, x: null };
-const isMedia = it => it.kind === 'file' && /^(image|video)\//.test(it.mime || '') && (it.dir === 'out' || it.state === 'done');
+const isMedia = it => it.kind === 'file' && /^(image|video)\//.test(it.mime || '') && (it.dir === 'out' ? !!it.file : it.state === 'done' && !!it.url);
 function mediaUrl(it) {
   if (it.dir === 'in') return it.url;
   if (!it.viewUrl) it.viewUrl = it.thumb || URL.createObjectURL(it.file);
   return it.viewUrl;
 }
 function openViewer(it) {
-  V.list = S.feed.filter(isMedia).reverse();   // 오래된 것부터
+  V.list = S.feed.filter(isMedia);   // 오래된 것부터
   V.i = Math.max(0, V.list.indexOf(it));
   $('#viewer').hidden = false;
   document.body.classList.add('noscroll');

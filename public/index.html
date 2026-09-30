@@ -99,21 +99,29 @@
       </button>
       <input type="file" id="folderInput" webkitdirectory multiple hidden>
     </div>
+    <section class="chat" aria-label="주고받은 것">
+      <div class="chat-head">
+        <h2>주고받은 것</h2>
+        <div class="chat-tools">
+          <button type="button" class="link" id="saveAllBtn" hidden>받은 파일 모두 저장</button>
+          <button type="button" class="link muted" id="clearHistBtn">기록 지우기</button>
+        </div>
+      </div>
+      <div class="chat-body">
+        <ul class="feed" id="feed"></ul>
+        <p class="feed-empty" id="feedEmpty">보내거나 받은 파일과 글이 여기에 대화처럼 쌓여요.<br>이 연결의 기록은 이 브라우저에 저장돼서, 나중에 "다시 연결"하면 다시 보여요.</p>
+        <button type="button" class="newmsg" id="newMsg" hidden>새 메시지 ↓</button>
+      </div>
+      <form class="textsend" id="textForm">
+        <textarea id="textInput" rows="1" placeholder="글, 링크, 계좌번호 보내기" aria-label="보낼 글"></textarea>
+        <button type="submit">보내기</button>
+      </form>
+    </section>
     <div class="dlrow" id="dlRow" hidden><span id="dlText"></span><div class="dlbtns" id="dlBtns"></div></div>
 
-    <form class="textsend" id="textForm">
-      <textarea id="textInput" rows="1" placeholder="글, 링크, 계좌번호 보내기" aria-label="보낼 글"></textarea>
-      <button type="submit">보내기</button>
-    </form>
 
     <section class="sync" id="syncBox" hidden></section>
 
-    <div class="feed-head">
-      <h2>주고받은 것</h2>
-      <button type="button" class="link" id="saveAllBtn" hidden>받은 파일 모두 저장</button>
-    </div>
-    <ul class="feed" id="feed"></ul>
-    <p class="feed-empty" id="feedEmpty">보내거나 받은 파일이 여기에 쌓여요.</p>
   </section>
 </main>
 
