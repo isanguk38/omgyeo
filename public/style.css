@@ -419,3 +419,11 @@ body.in-room > .top,body.in-room > .secure-note,body.in-room > .wake{flex:none;w
   .in-room .room{grid-template-rows:auto minmax(0,1fr)}
   body.side-open.in-room .room{grid-template-rows:auto auto minmax(0,1fr)}
 }
+
+/* 폴더째 보내기 버튼: 연한 주황 배경 + 아이콘 + "폴더" (다른 버튼 스타일에 덮이지 않도록 id로 지정) */
+#textForm #folderBtn{width:auto;min-width:42px;height:42px;padding:0 12px;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  background:var(--accent-soft);color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:12px;font-size:13px;font-weight:700}
+#textForm #folderBtn:hover:not(:disabled){background:color-mix(in srgb,var(--accent) 22%,var(--surface));border-color:var(--accent);color:var(--accent)}
+#textForm #folderBtn:disabled{opacity:.45;cursor:not-allowed}
+#textForm #folderBtn svg{flex:none}
+@media (max-width:640px){#textForm #folderBtn{padding:0;width:42px}#textForm #folderBtn .fb-label{display:none}}
