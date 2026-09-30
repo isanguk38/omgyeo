@@ -56,6 +56,9 @@
   <section class="hero">
     <h1>폰, PC, 태블릿 사이에서<br>원본 그대로 옮기세요</h1>
     <p>아이폰과 갤럭시, 윈도우와 맥 모두 됩니다. 설치도 로그인도 필요 없어요.</p>
+    <ul class="hero-chips" aria-label="특징">
+      <li>설치·가입 없음</li><li>용량 제한 없음</li><li>원본 그대로</li><li>서버에 안 남음</li><li>종단간 암호화</li>
+    </ul>
   </section>
   <div class="starts">
     <button type="button" class="card-btn primary" id="createBtn">
@@ -70,6 +73,7 @@
       </div>
     </form>
   </div>
+  <a class="intro-jump" href="#intro">처음이신가요? 옮겨 알아보기 <span aria-hidden="true">↓</span></a>
   <section class="recent" id="recentBox" hidden>
     <h2>이전에 연결한 기기</h2>
     <ul id="recentList"></ul>
@@ -81,6 +85,96 @@
     <label class="keep-label">파일 내용 보관 기간 <select class="keep-select" aria-label="파일 내용 보관 기간"></select></label>
     <span class="keep-help"></span>
     <div class="keep-confirm" hidden><span class="kc-text"></span><div class="kc-btns"><button type="button" class="solid" data-keep="ok">바꾸기</button><button type="button" data-keep="no">취소</button></div></div>
+    </section>
+  </div>
+
+  <!-- 처음 온 사람을 위한 소개 (연결 버튼 아래, 스크롤하면 보임) -->
+  <div class="intro" id="intro">
+    <section class="in-block" aria-labelledby="in-how">
+      <p class="in-eyebrow">사용법</p>
+      <h2 id="in-how">세 단계면 끝나요</h2>
+      <ol class="in-steps">
+        <li><b>두 기기에서 이 주소 열기</b><span>보내는 기기와 받는 기기 모두 브라우저로 엽니다. 받는 사람도 설치할 것이 없어요.</span></li>
+        <li><b>코드로 연결</b><span>한쪽에서 <em>새로 연결하기</em>를 누르면 QR과 6자리 코드가 나와요. 다른 쪽에서 찍거나 입력하세요.</span></li>
+        <li><b>보내기</b><span>파일이나 폴더를 끌어다 놓거나 <em>+</em>를 누르세요. 글도 대화처럼 주고받아요.</span></li>
+      </ol>
+    </section>
+
+    <section class="in-block" aria-labelledby="in-why">
+      <p class="in-eyebrow">장점</p>
+      <h2 id="in-why">왜 옮겨인가요</h2>
+      <div class="in-merits">
+        <div><b>설치·가입이 필요 없어요</b><span>받는 사람도요. 프로그램 설치가 막힌 회사·학교 PC에서도 되고, 개인정보도 받지 않아요.</span></div>
+        <div><b>용량 제한 없이 원본 그대로</b><span>큰 영상도 나누지 않고 보내요. 사진 화질, 파일 이름, 폴더 구조가 그대로예요.</span></div>
+        <div><b>서버에 남지 않고, 서버도 못 봐요</b><span>파일을 서버에 저장하지 않아요. 종단간 암호화라 서버를 거쳐 가도 내용을 볼 수 없어요.</span></div>
+        <div><b>올렸다 받지 않아서 빨라요</b><span>가능하면 기기끼리 바로 보내요. 같은 와이파이면 인터넷을 거치지도 않아요.</span><small>직접 연결이 막힌 회사망 등에서는 서버를 거쳐 가서 느릴 수 있어요.</small></div>
+        <div><b>기기를 가리지 않아요</b><span>아이폰에서 윈도우 PC로, 갤럭시에서 맥으로. 같은 주소 하나로 이어져요.</span></div>
+        <div><b>끊겨도 이어서 보내요</b><span>전송 중 끊기면 받은 지점부터 다시 보내요. 처음부터 다시 보낼 필요가 없어요.</span></div>
+      </div>
+    </section>
+
+    <section class="in-block" aria-labelledby="in-pc">
+      <p class="in-eyebrow">PC끼리 쓰면 더 좋아요 · 크롬·엣지</p>
+      <h2 id="in-pc">폴더째, 바뀐 것만</h2>
+      <div class="in-pc">
+        <div><b>폴더 동기화</b><span>폴더를 지정해 두면 추가·수정·삭제된 파일만 골라 상대 PC 폴더로 보내요. 어떤 줄이 바뀌었는지도 보여 줘요.</span></div>
+        <div><b>받는 폴더 지정</b><span>받은 파일이 원하는 폴더에 바로 저장돼요. 큰 파일도 브라우저 메모리를 채우지 않아요.</span></div>
+        <div><b>연결마다 대화 기록</b><span>주고받은 파일과 글이 대화처럼 쌓이고, 다음에 같은 기기와 연결하면 그대로 있어요. 기록은 이 브라우저에만 저장돼요.</span></div>
+        <div><b>모임 앨범</b><span>여럿이 찍은 사진을 한곳에 모아 원본으로 나눠 가져요.</span></div>
+      </div>
+    </section>
+
+    <section class="in-block" aria-labelledby="in-cmp">
+      <p class="in-eyebrow">비교</p>
+      <h2 id="in-cmp">메신저·메일로 보내는 것과 달라요</h2>
+      <div class="in-table">
+        <table>
+          <thead><tr><th scope="col"></th><th scope="col">메신저</th><th scope="col">이메일</th><th scope="col">클라우드</th><th scope="col" class="us">옮겨</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">용량</th><td>파일당 제한</td><td>보통 25MB 안팎</td><td>저장 공간만큼</td><td class="us">제한 없음</td></tr>
+            <tr><th scope="row">사진 화질</th><td>기본은 압축</td><td>원본</td><td>원본</td><td class="us">원본</td></tr>
+            <tr><th scope="row">전송</th><td>올렸다 받음</td><td>올렸다 받음</td><td>올렸다 받음</td><td class="us">한 번에 보냄</td></tr>
+            <tr><th scope="row">서버에 남음</th><td>남음</td><td>남음</td><td>남음</td><td class="us">안 남음</td></tr>
+            <tr><th scope="row">설치·가입</th><td>필요</td><td>필요</td><td>필요</td><td class="us">필요 없음</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="in-fine">다른 서비스의 제한은 요금제·설정에 따라 다를 수 있어요.</p>
+    </section>
+
+    <section class="in-block" aria-labelledby="in-use">
+      <p class="in-eyebrow">쓰임새</p>
+      <h2 id="in-use">이럴 때 쓰세요</h2>
+      <div class="in-uses">
+        <div class="good">
+          <b>옮겨가 편한 경우</b>
+          <ul>
+            <li>폰 사진·영상을 원본 그대로 PC로 옮길 때</li>
+            <li>회사 PC 작업 폴더를 집 PC로 옮길 때 (바뀐 것만)</li>
+            <li>메신저에 로그인하기 싫은 PC에서 파일을 받을 때</li>
+            <li>용량이 커서 메신저·메일로 안 보내질 때</li>
+            <li>여행·모임 사진을 여럿이 모아 나눠 가질 때</li>
+          </ul>
+        </div>
+        <div class="other">
+          <b>메신저·메일이 나은 경우</b>
+          <ul>
+            <li>상대가 지금 접속해 있지 않아 나중에 받아야 할 때</li>
+            <li>이미 대화 중인 사람에게 작은 파일 한두 개를 보낼 때</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="in-block" aria-labelledby="in-know">
+      <p class="in-eyebrow">알아 두세요</p>
+      <h2 id="in-know">처음 쓰기 전에</h2>
+      <dl class="in-know">
+        <div><dt>두 기기 모두 이 사이트가 열려 있어야 해요</dt><dd>서버에 맡겨 두지 않고 기기끼리 직접 보내기 때문이에요. 그래서 파일이 어디에도 남지 않아요.</dd></div>
+        <div><dt>처음 열 때 30초~1분 걸릴 수 있어요</dt><dd>무료 서버라 한동안 안 쓰면 잠들어 있다가 깨어나요. 한 번 깨어나면 바로 돼요.</dd></div>
+        <div><dt>폴더 동기화·받는 폴더 지정은 PC 크롬·엣지에서만</dt><dd>기본 전송과 대화는 대부분의 최신 브라우저에서 돼요.</dd></div>
+      </dl>
+      <button type="button" class="in-help" data-open-help="start">기능별 자세한 사용법 보기</button>
     </section>
   </div>
 </main>

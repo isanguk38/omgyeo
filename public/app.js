@@ -1975,6 +1975,13 @@ function showHelp(topic) {
   for (const sec of document.querySelectorAll('#helpBody > section')) sec.hidden = sec.id !== `help-${topic}`;
   $('#helpBody').scrollTop = 0;
 }
+// 홈 소개의 '자세한 사용법 보기'
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-open-help]');
+  if (!b) return;
+  showHelp(b.dataset.openHelp);
+  $('#helpDlg').showModal();
+});
 $('#helpBtn').onclick = () => {
   // 지금 보고 있는 화면에 맞는 설명부터
   const tab = document.querySelector('.tabs [aria-selected="true"]');
