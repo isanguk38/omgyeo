@@ -20,7 +20,8 @@ const MERGE_AT = 32 * 1024 * 1024;   // 받은 조각을 이만큼마다 Blob으
 const P2P_WAIT = 6000;               // 직접 연결을 기다리는 시간
 const LANES = 3;                     // 직접 연결일 때 더 여는 통로 수 (기본 통로 포함 4개로 나눠 보냄)
 const LANES_OK = typeof RTCPeerConnection !== 'undefined';
-const SEND_STALL = 45000;            // 이만큼 한 조각도 못 보내면 멈춘 것으로 보고 다시 시도
+const MAIN_LIMIT = 256 * 1024;       // 추가 통로가 있으면 기본 통로에는 조각을 이만큼까지만 쌓음 (글이 빨리 지나가게)
+const SEND_STALL = 45000;           // 이만큼 한 조각도 못 보내면 멈춘 것으로 보고 다시 시도
 const MAX_RETRY = 8;                 // 같은 기기에 연결된 상태에서 재시도 횟수
 const ZIP_LIMIT = 0xFFFFFFFF;        // zip(비압축, zip64 미지원) 한계
 const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
@@ -308,7 +309,7 @@ function addPeer(info, initiator) {
     id: info.id, dev: info.dev || info.id, name: info.name, kind: info.kind, pub: info.pub,
     pc: null, dc: null, mode: 'connecting', queue: [], busy: false, pending: [],
     key: null, safety: null, waiters: new Map(), recvChain: Promise.resolve(), sendChain: Promise.resolve(),
-    initiator, lanes: null, laneGen: 0,
+    initiator, lanes: null, laneGen: 0, fastChain: Promise.resolve(), fastRecv: Promise.resolve(),
   };
   S.peers.set(p.id, p);
   p.caps = info.caps || {};
@@ -442,11 +443,15 @@ async function sendChunk(st, data) {
   for (;;) {
     if (!alive(p) || p.laneGen !== st.gen) throw new Error('closed');
     if (Date.now() - t0 > SEND_STALL) throw new Error('stalled');   // 상대가 받아 가지 않음 (탭이 멈췄거나 통로가 막힘)
-    const chans = openChans(p);
-    if (!chans.length) throw new Error('closed');
-    let best = chans[0];
-    for (const c of chans) if (c.bufferedAmount < best.bufferedAmount) best = c;
-    if (best.bufferedAmount < HIGH_WATER) { best.send(frame); return; }
+    // 기본 통로는 글·안내가 지나가는 길이라, 추가 통로가 있으면 조각은 조금만 싣게 함
+    const all = openChans(p);
+    if (!all.length) throw new Error('closed');
+    const extra = all.filter(c => c !== p.dc);
+    const chans = extra.length ? all : [p.dc];
+    const limit = c => (c === p.dc && extra.length ? MAIN_LIMIT : HIGH_WATER);
+    let best = null;
+    for (const c of chans) if (c.bufferedAmount < limit(c) && (!best || c.bufferedAmount < best.bufferedAmount)) best = c;
+    if (best) { best.send(frame); return; }
     await new Promise(resolve => {   // 어느 통로든 비면 이어서
       const done = () => { clearTimeout(t); for (const c of chans) { c.removeEventListener('bufferedamountlow', done); c.removeEventListener('close', done); } resolve(); };
       const t = setTimeout(done, 1000);
@@ -522,24 +527,48 @@ function drain(p, how) {
   });
 }
 // 제어 메시지는 기기마다 순서대로 (암호화가 비동기라 순서가 섞이지 않게)
+// 파일 조각과 순서가 상관없는 짧은 메시지(글, 확인 응답, 진행 알림)는 따로 줄을 세워 파일 전송 뒤에서 기다리지 않게 함
+const FAST_CTRL = new Set(['text', 'msg-del', 'ack', 'resume', 'sync-alive', 'sync-acks', 'sync-ack', 'sync-err', 'sync-scan', 'sync-busy', 'sync-waiting', 'sync-peek', 'sync-peekr']);
 function sendCtrl(p, obj, how) {
-  const task = p.sendChain.then(async () => {
+  const fast = FAST_CTRL.has(obj.t);
+  const chain = fast ? 'fastChain' : 'sendChain';
+  const task = p[chain].then(async () => {
     await p.keyP;
     let h = how || via(p);
     const frame = await frameCtrl(p, obj);
-    await drain(p, h);
+    if (!fast) await drain(p, h);
     // 통로를 지정하지 않은 메시지(확인 응답 등)는 직접 연결이 막 닫혔으면 서버 경유로 보내서 유실되지 않게
     if (!canSend(p, h) && !how && h === 'dc') h = 'relay';
     if (!canSend(p, h)) throw new Error('closed');
     rawSend(p, h, frame);
   });
-  p.sendChain = task.catch(() => {});
+  p[chain] = task.catch(() => {});
   return task;
 }
 
 // ---------- 받은 프레임 처리 (기기마다 도착 순서대로) ----------
 function onFrame(p, u8) {
+  const t = u8[0];
+  if (t === 0 || t === 2) {
+    // 제어 메시지는 바로 풀어 보고, 글·확인 응답이면 밀려 있는 파일 조각 처리를 기다리지 않고 먼저 처리
+    const msg = decodeCtrl(p, u8);
+    msg.then(m => {
+      if (FAST_CTRL.has(m.t)) p.fastRecv = p.fastRecv.then(() => onCtrl(p, m)).catch(err => console.warn('recv', err));
+    }, () => {});
+    p.recvChain = p.recvChain.then(async () => {   // 나머지(파일 안내 등)는 조각과의 순서를 지키도록 원래 줄에서
+      const m = await msg;
+      if (FAST_CTRL.has(m.t)) return;
+      await onCtrl(p, m);
+      if (S.reorder.size) await flushStreams(p);   // 이 안내를 기다리던 조각이 있으면 이어서 처리
+    }).catch(err => console.warn('recv', err));
+    return;
+  }
   p.recvChain = p.recvChain.then(() => handleFrame(p, u8)).catch(err => console.warn('recv', err));
+}
+async function decodeCtrl(p, u8) {
+  if (u8[0] === 0) return JSON.parse(dec.decode(u8.subarray(1)));
+  const key = p.key || await p.keyP;
+  return JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(1, 13) }, key, u8.subarray(13))));
 }
 async function handleFrame(p, u8) {
   const t = u8[0];
