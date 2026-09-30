@@ -518,3 +518,30 @@ body.in-room > .notify-ask{flex:none}
 .wb-text span{font-size:12px;color:var(--muted)}
 .waitbox button{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:8px 14px;font-size:13px;font-weight:700}
 @media (max-width:520px){.join-req{flex-wrap:wrap}.jr-btns{flex-direction:row;width:100%}.jr-btns button{flex:1}}
+
+/* 사용 설명서 */
+.help-btn{font-weight:800;font-size:15px}
+.help-dlg{height:min(680px,calc(100% - 48px))}
+.help-wrap{flex:1;min-height:0;display:grid;grid-template-columns:180px minmax(0,1fr)}
+.help-nav{display:flex;flex-direction:column;gap:2px;padding:12px;border-right:1px solid var(--line);overflow-y:auto}
+.help-nav button{border:0;background:none;text-align:left;border-radius:8px;padding:8px 10px;font-size:13px;font-weight:600;color:var(--muted)}
+.help-nav button:hover{color:var(--ink);background:var(--sunk)}
+.help-nav button[aria-current="true"]{background:var(--accent-soft);color:var(--accent)}
+.help-body{overflow-y:auto;padding:18px 22px 26px;font-size:14px;line-height:1.7}
+.help-body h3{margin:0 0 10px;font-size:18px}
+.help-body h4{margin:18px 0 6px;font-size:14px}
+.help-body p,.help-body ul,.help-body ol{margin:0 0 10px;max-width:62ch}
+.help-body ul,.help-body ol{padding-left:20px;display:flex;flex-direction:column;gap:4px}
+.help-tip{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--muted)}
+.help-faq{margin:0;display:flex;flex-direction:column;gap:4px}
+.help-faq dt{font-weight:700;margin-top:10px}
+.help-faq dd{margin:0;color:var(--muted)}
+@media (max-width:640px){
+  .help-wrap{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+  .help-nav{flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px}
+  .help-nav button{white-space:nowrap}
+  .help-body{padding:14px 16px 20px}
+}
+/* 동기화 상태 표시 */
+.pr-name .spin,.sc-status .spin{display:inline-block;width:11px;height:11px;border-width:2px;vertical-align:-1px;margin-right:6px}
+.pr-count{color:var(--muted);font-variant-numeric:tabular-nums}

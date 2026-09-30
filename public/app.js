@@ -1118,6 +1118,7 @@ function showRoom(room) {
   S.hist = null;
   S.shownRoom = room;
   if (room) loadRoomHistory(room);
+  if (typeof Sync !== 'undefined' && Sync.setRoom) Sync.setRoom(room);
   if (typeof Album !== 'undefined') Album.load(room);
 }
 
@@ -1759,6 +1760,23 @@ function onJoinDenied(m) {
   toast(msg, 5000);
 }
 
+// ---------- 사용 설명서 ----------
+function showHelp(topic) {
+  for (const b of document.querySelectorAll('#helpNav [data-help]')) b.setAttribute('aria-current', String(b.dataset.help === topic));
+  for (const sec of document.querySelectorAll('#helpBody > section')) sec.hidden = sec.id !== `help-${topic}`;
+  $('#helpBody').scrollTop = 0;
+}
+$('#helpBtn').onclick = () => {
+  // 지금 보고 있는 화면에 맞는 설명부터
+  const tab = document.querySelector('.tabs [aria-selected="true"]');
+  const topic = !S.room ? 'start' : tab && tab.dataset.tab === 'sync' ? 'sync' : tab && tab.dataset.tab === 'album' ? 'album' : 'send';
+  showHelp(topic);
+  $('#helpDlg').showModal();
+};
+$('#helpNav').addEventListener('click', e => { const b = e.target.closest('[data-help]'); if (b) showHelp(b.dataset.help); });
+$('#helpClose').onclick = () => $('#helpDlg').close();
+$('#helpDlg').addEventListener('click', e => { if (e.target.id === 'helpDlg') $('#helpDlg').close(); });
+
 // ---------- 시작 ----------
 (async function start() {
   // 앱 화면을 캐시해 두어 서버가 잠들어 있어도 화면은 바로 뜨게 함
@@ -1771,6 +1789,8 @@ function onJoinDenied(m) {
   setNet(false);
   if (!globalThis.isSecureContext) $('#secureNote').hidden = false;
   await Promise.all([initCrypto(), loadIce()]);
+  // 폴더 동기화(sync.js)·모임 앨범(album.js)까지 모두 불러온 뒤에 연결해야 방에 들어갈 때 그 방의 설정을 놓치지 않음
+  if (document.readyState === 'loading') await new Promise(r => addEventListener('DOMContentLoaded', r, { once: true }));
   connect();
   loadInfo();
   loadDl();
