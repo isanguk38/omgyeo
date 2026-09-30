@@ -30,15 +30,24 @@ Mafia.onServer = m => {
 // 방을 나가거나 다른 방으로 가면 게임 화면을 치움
 Mafia.reset = () => { Mafia.g = null; Mafia.mlog = []; Mafia.notes = []; mRender(); };
 // 대화 기록을 다시 그리면(이전 기록 불러오기 등) 목록이 비워지므로, 이번 게임의 안내를 다시 붙임
-Mafia.replayNotes = () => { for (const n of Mafia.notes) mNotice(n.text, n.tone, true); };
+Mafia.replayNotes = () => { for (const n of Mafia.notes) mNotice(n.text, n.tone, n.time); };
+// 기록 지우기: 그 시각까지의 사회자 안내를 화면과 기억에서 지움
+Mafia.clearNotes = until => {
+  Mafia.notes = Mafia.notes.filter(n => n.time > until);
+  for (const li of feedBox().querySelectorAll('.narr')) if (Number(li.dataset.t) <= until) li.remove();
+  if (!feedBox().querySelector('li:not(.day):not(.more)')) $('#feedEmpty').hidden = false;
+};
 
 // 사회자 안내: 대화 목록 가운데에 한 줄 (저장하지 않음)
+// replay: 다시 붙일 때 원래 시각 (없으면 새 안내)
 function mNotice(text, tone, replay) {
-  if (!replay) Mafia.notes.push({ text, tone });
+  const time = replay || Date.now();
+  if (!replay) Mafia.notes.push({ text, tone, time });
   const box = feedBox();
   const wasBottom = nearBottom();
   const li = document.createElement('li');
   li.className = `narr ${tone || 'info'}`;
+  li.dataset.t = time;
   li.innerHTML = `<span class="narr-who">${tone === 'secret' ? '사회자 · 나에게만' : '사회자'}</span><span class="narr-txt"></span>`;
   li.querySelector('.narr-txt').textContent = text;
   box.appendChild(li);
@@ -76,7 +85,7 @@ function mRender() {
   if (!g) { box.hidden = true; clearInterval(Mafia.tick); Mafia.tick = null; return; }
   box.hidden = false;
   const you = g.you;
-  const phase = { night: `${g.day}일째 밤`, morning: '아침', day: `${g.day}일째 낮`, result: '투표 결과', over: '게임 끝' }[g.phase] || '';
+  const phase = { intro: `${g.day}일째 낮 · 인사 시간`, night: `${g.day}일째 밤`, morning: `${g.day}일째 아침`, day: `${g.day}일째 낮 · 토론과 투표`, result: '투표 결과', over: '게임 끝' }[g.phase] || '';
   box.className = `mf-box ${g.phase}`;
 
   // 나의 역할과 지금 할 일
@@ -86,6 +95,7 @@ function mRender() {
     role = `나는 <b class="mf-role ${you.role}">${M_ROLE[you.role].name}</b>${you.alive ? '' : ' · <span class="mf-dead">탈락</span>'}`;
     if (g.phase === 'over') todo = g.winner ? `${g.winner === 'mafia' ? '마피아' : '시민'} 팀 승리${(g.winner === 'mafia') === (you.role === 'mafia') ? ' · 이겼어요!' : ''}` : '게임이 중단됐어요.';
     else if (!you.alive) todo = '탈락했어요. 끝날 때까지 구경할 수 있어요.';
+    else if (g.phase === 'intro') todo = `대화로 서로 인사를 나누세요. 첫날은 투표 없이 밤이 돼요.${g.ready ? ` (준비 ${g.ready.n}/${g.ready.of})` : ''}`;
     else if (g.phase === 'night') todo = you.role === 'citizen' ? '밤에는 할 일이 없어요. 아침을 기다리세요.' : `${M_ACT[you.role]}을 고르세요.${g.pick ? ` 고른 사람: <b>${esc((g.players.find(p => p.id === g.pick) || {}).name)}</b>` : ''}`;
     else if (g.phase === 'day') todo = g.pick === undefined ? '대화로 토론하고 마피아로 의심되는 사람에게 투표하세요.' : g.pick === null ? '기권했어요. 다른 사람을 눌러 바꿀 수 있어요.' : `<b>${esc((g.players.find(p => p.id === g.pick) || {}).name)}</b>에게 투표했어요. 바꿀 수 있어요.`;
     else todo = '잠시 뒤 다음 순서로 넘어가요.';
@@ -116,7 +126,7 @@ function mRender() {
 
   const ctl = g.phase === 'over'
     ? '<button type="button" class="solid" data-mfa="again">다시 하기</button><button type="button" data-mfa="close">닫기</button>'
-    : `${you && you.alive && g.phase === 'day' ? '<button type="button" data-mfa="abstain">기권</button>' : ''}<button type="button" class="link muted" data-mfa="stop">게임 중단</button>`;
+    : `${you && you.alive && g.phase === 'intro' ? (g.ready && g.ready.me ? '<button type="button" disabled>준비 완료 · 다른 사람을 기다려요</button>' : '<button type="button" class="solid" data-mfa="ready">준비 완료 · 밤으로</button>') : ''}${you && you.alive && g.phase === 'day' ? '<button type="button" data-mfa="abstain">기권</button>' : ''}<button type="button" class="link muted" data-mfa="stop">게임 중단</button>`;
 
   // 입력 중인 마피아 대화는 다시 그려도 지워지지 않게
   const draft = $('#mafiaChatInput') ? $('#mafiaChatInput').value : '';
@@ -144,6 +154,7 @@ $('#mafiaBox').addEventListener('click', e => {
   if (!b) return;
   switch (b.dataset.mfa) {
     case 'abstain': return mSend({ op: 'abstain' });
+    case 'ready': return mSend({ op: 'ready' });
     case 'again': return mSend({ op: 'start' });
     case 'close': return mSend({ op: 'stop' });
     case 'stop': if (confirm('게임을 중단할까요? 모두의 역할이 공개돼요.')) mSend({ op: 'stop' }); return;

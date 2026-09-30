@@ -1352,6 +1352,7 @@ async function applyDelete(room, mids, clear) {
     S.hist.shown = Math.min(S.hist.shown, S.hist.recs.length);
   }
   if (room === S.room) for (const it of S.feed.filter(x => finished(x) && ((midOf(x) && set.has(midOf(x))) || (clear && x.time <= clear)))) removeFeedItem(it);
+  if (room === S.room && clear && typeof Mafia !== 'undefined') Mafia.clearNotes(clear);   // 기록 지우기: 마피아 사회자 안내도 함께
   if (room === S.room && S.hist && S.hist.recs.length > S.hist.shown) renderHistory(false);
   return n;
 }

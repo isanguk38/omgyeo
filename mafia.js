@@ -1,11 +1,12 @@
 'use strict';
 /* 마피아 게임 — 서버가 사회자
- * 방마다 게임 하나. 역할 배정, 밤(마피아·의사·경찰 행동) → 아침 발표 → 낮 투표 → 처형 → 승패 판정을 서버가 진행합니다.
+ * 방마다 게임 하나. 역할 배정 → 1일째 낮(인사, 투표 없음) → 밤(마피아·의사·경찰 행동) → 아침 발표 → 낮 투표 → 처형 → 승패 판정을 서버가 진행합니다.
  * 역할은 본인에게만 보내고, 모든 행동은 서버가 검사합니다(화면에서 조작해도 규칙을 어길 수 없음).
  * 게임 정보는 서버 메모리에만 있고, 게임이 끝나거나 방이 비면 사라집니다.
  */
 const crypto = require('crypto');
 
+const INTRO_MS = 60000;          // 1일째 낮: 인사만 하고 투표 없이 밤으로 (모두 준비하면 바로)
 const NIGHT_MS = 40000;          // 밤: 마피아·의사·경찰이 고르는 시간
 const DAY_MS = 120000;           // 낮: 토론과 투표 시간
 const RESULT_MS = 4000;          // 발표 뒤 다음 단계까지 잠깐 쉼
@@ -17,12 +18,17 @@ function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) { const j = crypto.randomInt(0, i + 1); [a[i], a[j]] = [a[j], a[i]]; }
   return a;
 }
+// 인원수에 맞춘 역할 구성. 적은 인원에서는 특수 직업을 줄이고, 의사·경찰 중 누가 있는지는 무작위라 알려 주지 않음
+//   4~5명: 마피아 1 + 의사·경찰 중 1 / 6명: 마피아 1 + 의사 + 경찰 / 7~8명: 마피아 2 + 의사 + 경찰
+//   9~11명: 마피아 3 + 의사 + 경찰 / 12명 이상: 마피아 4 + 의사 + 경찰
 function rolesFor(n) {
-  const mafia = n >= 9 ? 3 : n >= 6 ? 2 : 1;
-  const r = Array(mafia).fill('mafia');
-  r.push('doctor', 'police');
+  const mafia = n >= 12 ? 4 : n >= 9 ? 3 : n >= 7 ? 2 : 1;
+  const both = n >= 6;
+  const specials = both ? ['doctor', 'police'] : [crypto.randomInt(0, 2) ? 'doctor' : 'police'];
+  const r = [...Array(mafia).fill('mafia'), ...specials];
   while (r.length < n) r.push('citizen');
-  return shuffle(r);
+  const summary = `마피아 ${mafia}명 · ${both ? '의사 1명 · 경찰 1명' : '의사나 경찰 중 1명'} · 시민 ${n - mafia - specials.length}명`;
+  return { roles: shuffle(r), summary };
 }
 
 module.exports = function createMafia(sendJSON) {
@@ -41,6 +47,7 @@ module.exports = function createMafia(sendJSON) {
     if (g.phase === 'day') for (const t of g.votes.values()) if (t) tally[t] = (tally[t] || 0) + 1;
     return {
       ev: 'state', phase: g.phase, day: g.day, deadline: g.deadline, starter: g.starter, winner: g.winner || null,
+      ready: g.phase === 'intro' ? { n: g.ready.size, of: living(g).length, me: g.ready.has(id) } : null,
       players: g.order.map(pid => {
         const p = g.players.get(pid);
         // 끝났거나, 나 자신이거나, 내가 마피아이고 상대도 마피아면 진짜 역할. 처형된 사람은 마피아였는지만 공개
@@ -62,16 +69,30 @@ module.exports = function createMafia(sendJSON) {
     if (peers.length < MIN_PLAYERS) return out(ws, { ev: 'error', text: `마피아 게임은 ${MIN_PLAYERS}명 이상이어야 해요. 지금 연결된 기기는 ${peers.length}대예요.` });
     if (peers.length > MAX_PLAYERS) return out(ws, { ev: 'error', text: `마피아 게임은 ${MAX_PLAYERS}명까지 할 수 있어요.` });
     if (room.game) clearTimeout(room.game.timer);
-    const roles = rolesFor(peers.length);
-    const g = room.game = { room, players: new Map(), order: [], phase: 'night', day: 1, deadline: 0, timer: null, acts: new Map(), votes: new Map(), starter: ws.name, checked: [] };
+    const { roles, summary } = rolesFor(peers.length);
+    const g = room.game = { room, players: new Map(), order: [], phase: 'intro', day: 1, deadline: 0, timer: null, acts: new Map(), votes: new Map(), ready: new Set(), starter: ws.name, checked: [] };
     peers.forEach((p, i) => { g.players.set(p.id, { id: p.id, name: p.name, role: roles[i], alive: true, ws: p }); g.order.push(p.id); });
-    const n = roles.filter(r => r === 'mafia').length;
-    say(g, `${ws.name}님이 마피아 게임을 시작했어요. 참가자 ${peers.length}명 · 마피아 ${n}명 · 의사 1명 · 경찰 1명`, 'start');
+    say(g, `${ws.name}님이 마피아 게임을 시작했어요. 참가자 ${peers.length}명 · ${summary}`, 'start');
     for (const p of g.players.values()) {
       const mates = p.role === 'mafia' ? [...g.players.values()].filter(q => q.role === 'mafia' && q !== p).map(q => q.name) : [];
       out(p.ws, { ev: 'secret', text: `당신은 ${ROLE_NAME[p.role]}입니다.${mates.length ? ` 동료 마피아: ${mates.join(', ')}` : ''}` });
     }
-    night(g);
+    intro(g);
+  }
+
+  // 1일째 낮: 서로 인사만 나누고 투표 없이 밤으로. 모두 준비 완료를 누르면 바로
+  function intro(g) {
+    g.phase = 'intro'; g.ready.clear();
+    say(g, '1일째 낮입니다. 대화로 서로 인사하고 이야기를 나눠 보세요. 첫날은 투표 없이 밤이 됩니다.', 'day');
+    setTimer(g, INTRO_MS, () => night(g));
+    push(g);
+  }
+  function ready(g, ws) {
+    const me = g.players.get(ws.id);
+    if (!me || !me.alive || g.phase !== 'intro') return;
+    g.ready.add(me.id);
+    push(g);
+    if (living(g).every(p => g.ready.has(p.id))) { clearTimeout(g.timer); night(g); }
   }
 
   function night(g) {
@@ -109,11 +130,12 @@ module.exports = function createMafia(sendJSON) {
       out(police.ws, { ev: 'secret', text: `조사 결과: ${nameOf(g, checkT)}님은 ${isMafia ? '마피아입니다.' : '마피아가 아닙니다.'}` });
     }
     g.phase = 'morning';
+    g.day++;   // 밤이 지나면 다음 날
     if (target && target !== saved) {
       g.players.get(target).alive = false;
-      say(g, `아침이 밝았습니다. 지난밤 ${nameOf(g, target)}님이 마피아에게 당했습니다.`, 'day');
-    } else if (target) say(g, '아침이 밝았습니다. 지난밤 마피아가 누군가를 노렸지만, 의사가 살려 냈습니다.', 'day');
-    else say(g, '아침이 밝았습니다. 지난밤에는 아무 일도 없었습니다.', 'day');
+      say(g, `${g.day}일째 아침이 밝았습니다. 지난밤 ${nameOf(g, target)}님이 마피아에게 당했습니다.`, 'day');
+    } else if (target) say(g, `${g.day}일째 아침이 밝았습니다. 지난밤 마피아가 누군가를 노렸지만, 의사가 살려 냈습니다.`, 'day');
+    else say(g, `${g.day}일째 아침이 밝았습니다. 지난밤에는 아무 일도 없었습니다.`, 'day');
     if (checkWin(g)) return;
     g.phase = 'day'; g.votes.clear();
     say(g, `토론한 뒤 마피아로 의심되는 사람에게 투표해 주세요. 제한 시간 ${DAY_MS / 60000}분.`, 'day');
@@ -140,7 +162,6 @@ module.exports = function createMafia(sendJSON) {
     } else say(g, counts.size ? '투표가 동점이라 아무도 처형되지 않았습니다.' : '아무도 투표하지 않아 처형이 없습니다.', 'info');
     push(g);
     if (checkWin(g)) return;
-    g.day++;
     setTimer(g, RESULT_MS, () => night(g));
   }
 
@@ -193,6 +214,7 @@ module.exports = function createMafia(sendJSON) {
         case 'start': return start(room, ws);
         case 'act': if (g) act(g, ws, String(m.target || '')); return;
         case 'abstain': if (g) abstain(g, ws); return;
+        case 'ready': if (g) ready(g, ws); return;
         case 'chat': {   // 밤에 마피아끼리만 보는 대화
           const me = g && g.players.get(ws.id);
           if (!me || !me.alive || me.role !== 'mafia' || g.phase !== 'night') return;
@@ -227,6 +249,8 @@ module.exports = function createMafia(sendJSON) {
       say(g, `${p.name}님이 연결을 끊어서 게임에서 빠졌습니다.`, 'info');
       if (checkWin(g)) return;
       push(g);
+      g.ready.delete(p.id);
+      if (g.phase === 'intro' && living(g).every(q => g.ready.has(q.id))) { clearTimeout(g.timer); night(g); }
       if (g.phase === 'night') maybeEndNight(g);
       if (g.phase === 'day' && living(g).every(q => g.votes.has(q.id))) { clearTimeout(g.timer); execute(g); }
     },
