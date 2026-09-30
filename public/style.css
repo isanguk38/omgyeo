@@ -547,3 +547,8 @@ body.in-room > .notify-ask{flex:none}
 /* 동기화 상태 표시 */
 .pr-name .spin,.sc-status .spin{display:inline-block;width:11px;height:11px;border-width:2px;vertical-align:-1px;margin-right:6px}
 .pr-count{color:var(--muted);font-variant-numeric:tabular-nums}
+.pr-bar{display:block;height:6px;border-radius:999px;background:var(--line);overflow:hidden;margin:6px 0 2px}
+.pr-bar i{display:block;height:100%;background:var(--accent);border-radius:inherit;transition:width .4s ease}
+.pr-now{display:flex;gap:4px;min-width:0;color:var(--muted);font-variant-numeric:tabular-nums;flex-wrap:wrap}
+.pr-now .pr-files{max-width:100%}
+.pr-wait{color:var(--warn,#b7791f)}

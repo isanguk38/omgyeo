@@ -20,6 +20,7 @@ const MERGE_AT = 32 * 1024 * 1024;   // 받은 조각을 이만큼마다 Blob으
 const P2P_WAIT = 6000;               // 직접 연결을 기다리는 시간
 const LANES = 3;                     // 직접 연결일 때 더 여는 통로 수 (기본 통로 포함 4개로 나눠 보냄)
 const LANES_OK = typeof RTCPeerConnection !== 'undefined';
+const SEND_STALL = 45000;            // 이만큼 한 조각도 못 보내면 멈춘 것으로 보고 다시 시도
 const MAX_RETRY = 8;                 // 같은 기기에 연결된 상태에서 재시도 횟수
 const ZIP_LIMIT = 0xFFFFFFFF;        // zip(비압축, zip64 미지원) 한계
 const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
@@ -429,7 +430,7 @@ async function sendChunk(st, data) {
   const { p, how, fid } = st;
   if (!st.multi) {
     const frame = await frameChunk(p, fid, data);
-    await drain(p, how);
+    await Promise.race([drain(p, how), bgSleep(SEND_STALL).then(() => { throw new Error('stalled'); })]);
     if (!canSend(p, how)) throw new Error('closed');
     rawSend(p, how, frame);
     st.off += data.length;
@@ -437,8 +438,10 @@ async function sendChunk(st, data) {
   }
   const frame = await frameChunkAt(p, fid, st.off, data);
   st.off += data.length;
+  const t0 = Date.now();
   for (;;) {
     if (!alive(p) || p.laneGen !== st.gen) throw new Error('closed');
+    if (Date.now() - t0 > SEND_STALL) throw new Error('stalled');   // 상대가 받아 가지 않음 (탭이 멈췄거나 통로가 막힘)
     const chans = openChans(p);
     if (!chans.length) throw new Error('closed');
     let best = chans[0];
@@ -447,6 +450,7 @@ async function sendChunk(st, data) {
     await new Promise(resolve => {   // 어느 통로든 비면 이어서
       const done = () => { clearTimeout(t); for (const c of chans) { c.removeEventListener('bufferedamountlow', done); c.removeEventListener('close', done); } resolve(); };
       const t = setTimeout(done, 1000);
+      bgTimer(done, 1000);   // 가려진 탭에서도 1초마다 다시 확인
       for (const c of chans) { c.addEventListener('bufferedamountlow', done); c.addEventListener('close', done); }
     });
   }

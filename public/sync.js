@@ -293,7 +293,18 @@ async function push(sess) {
   const dels = Sync.share.mirror ? [...sess.diff.extra] : [];
   sess.state = 'syncing';
   markResume(sess, true);
-  sess.prog = { done: 0, total: list.length, bytes: 0, wire: 0, totalBytes: sess.diff.bytes, errors: 0, start: performance.now(), files: [], diffs: {}, status: new Map(sess.diff.status) };
+  sess.prog = { done: 0, total: list.length, bytes: 0, wire: 0, totalBytes: sess.diff.bytes, errors: 0, start: performance.now(), files: [], diffs: {}, status: new Map(sess.diff.status),
+    cur: null, phase: 'send', lastMove: Date.now(), hist: [], ackBytes: 0 };
+  // 1초마다 화면을 새로 그려 속도·마지막 진행 시각을 보여 줌 (멈춘 건지 보내는 중인지 알 수 있게)
+  const ticker = () => {
+    const pg = sess.prog;
+    if (sess.state !== 'syncing' || !pg) return;
+    pg.hist.push([Date.now(), pg.ackBytes, pg.done]);   // 최근 20초의 실제 저장 속도로 남은 시간을 계속 다시 계산
+    if (pg.hist.length > 20) pg.hist.shift();
+    syncRender();
+    bgTimer(ticker, 1000);
+  };
+  bgTimer(ticker, 1000);
   sess.inflight = 0; sess.pending.clear();
   sess.lastAck = Date.now();
   syncRender();
@@ -302,15 +313,17 @@ async function push(sess) {
   // 확인 응답을 기다림. 응답이 SYNC_STALL 동안 없으면 멈춘 것으로 보고 중단 (영원히 기다리지 않음)
   const waitAcks = async done => {
     const started = Date.now();
+    sess.prog.phase = 'ack';
     while (!done() && aliveNow()) {
       await Promise.race([new Promise(r => sess.wake.push(r)), bgSleep(1000)]);
       if (Date.now() - Math.max(sess.lastAck, started) > SYNC_STALL) throw new Error('stalled');
     }
+    if (sess.prog) sess.prog.phase = 'send';
   };
   // 원본 바이트 스트림을 (필요하면 압축해서) 조각으로 보냄. 진행률은 원본 기준으로 셈
   const streamOut = async (how, fid, source, zip) => {
     const chunk = how === 'dc' ? CHUNK_DC : CHUNK_WS;
-    const counter = new TransformStream({ transform(c, ctl) { sess.prog.bytes += c.byteLength; ctl.enqueue(c); } });
+    const counter = new TransformStream({ transform(c, ctl) { const pg = sess.prog; pg.bytes += c.byteLength; pg.lastMove = Date.now(); if (pg.cur) pg.cur.sent += c.byteLength; ctl.enqueue(c); } });
     let stream = source.pipeThrough(counter);
     if (zip) stream = stream.pipeThrough(new CompressionStream('gzip'));
     const reader = stream.getReader();
@@ -355,6 +368,7 @@ async function push(sess) {
         if (!f) { sess.prog.total--; continue; }
         const zip = ZIP_OK && compressible(u.single) && f.file.size >= 4096;
         await sendCtrl(p, { t: 'sync-file', sid, fid, path: u.single, size: f.file.size, hash: f.hash, z: zip ? 'gzip' : undefined }, how);
+        sess.prog.cur = { name: u.single, size: f.file.size, sent: 0 };
         track(u.single, f.file.size);
         const n = await streamOut(how, fid, f.file.stream(), zip);
         if (zip) await sendCtrl(p, { t: 'sync-end', sid, fid, n }, how);
@@ -369,12 +383,14 @@ async function push(sess) {
         const bytes = files.reduce((a, f) => a + f.size, 0);
         const zip = ZIP_OK && bytes >= 2048 && files.some(f => compressible(f.path));
         await sendCtrl(p, { t: 'sync-batch', sid, fid, files, z: zip ? 'gzip' : undefined }, how);
+        sess.prog.cur = { name: `작은 파일 ${files.length}개 묶음`, size: bytes, sent: 0 };
         for (const f of files) track(f.path, f.size);
         const n = bytes ? await streamOut(how, fid, new Blob(blobs).stream(), zip) : 0;
         if (zip || !bytes) await sendCtrl(p, { t: 'sync-end', sid, fid, n }, how);
       }
     }
     // 마지막 파일들의 확인을 기다림
+    sess.prog.cur = null; sess.prog.allSent = true;
     await waitAcks(() => !sess.pending.size);
     if (!aliveNow()) throw new Error('peer gone');
     const n = sess.prog.done;
@@ -420,6 +436,7 @@ async function push(sess) {
 }
 function onAckItem(sess, it, ok) {
   sess.lastAck = Date.now();
+  if (sess.prog) sess.prog.lastMove = Date.now();
   if (ok && sess.remote) sess.remote.set(it.path, [it.size, it.hash]);
   if (ok && sess.prog) {
     sess.prog.files.push([it.path, it.st || sess.prog.status.get(it.path) || 'M', it.size, it.adds ?? null, it.dels ?? null]);
@@ -427,7 +444,7 @@ function onAckItem(sess, it, ok) {
   }
   const w = sess.pending.get(it.path);
   if (w != null) { sess.pending.delete(it.path); sess.inflight -= w; }
-  if (sess.prog) { if (ok) sess.prog.done++; else sess.prog.errors++; }
+  if (sess.prog && w != null) { if (ok) { sess.prog.done++; sess.prog.ackBytes += Number(it.size) || 0; } else sess.prog.errors++; }   // 같은 파일을 두 번 세지 않게
 }
 // 보내는 중이던 기기를 이 브라우저에 기억 (새로고침·연결 끊김 후 이어서 보내기용)
 const resumeKey = sess => `${Sync.room}:${sess.pid}`;
@@ -638,7 +655,7 @@ async function inBatch(p, m) {
   const files = (Array.isArray(m.files) ? m.files : []).slice(0, 1000).map(f => ({ path: String(f.path || ''), size: Math.max(0, Number(f.size) || 0), hash: String(f.hash || '') }));
   if (!s || !['ready', 'receiving'].includes(s.state)) return sendAcks(p, m.sid, [], files.map(f => f.path));
   unitStart(s);
-  const u = { kind: 'batch', s, p, files, idx: 0, cur: null, left: 0, items: [], errs: [], got: 0, total: files.reduce((a, f) => a + f.size, 0), z: m.z === 'gzip' };
+  const u = { kind: 'batch', s, p, files, idx: 0, cur: null, left: 0, items: [], errs: [], closing: new Set(), got: 0, total: files.reduce((a, f) => a + f.size, 0), z: m.z === 'gzip' };
   // 다음 파일 열기 (빈 파일은 바로 닫음)
   const next = async () => {
     while (u.idx < files.length) {
@@ -666,13 +683,29 @@ async function inBatch(p, m) {
       }
       off += n; u.left -= n;
       if (u.left === 0) {
-        if (!u.cur.skip) { try { u.items.push(await closeRecv(u.cur)); } catch { u.errs.push(u.cur.raw); } }
+        if (!u.cur.skip) {
+          // 닫기(임시 파일 옮기기·검사)는 기다리지 않고 다음 파일을 씀. 동시에 최대 8개까지
+          const st = u.cur;
+          const job = closeRecv(st).then(it => { u.items.push(it); }, () => { u.errs.push(st.raw); }).then(() => u.flushAcks());
+          u.closing.add(job);
+          job.finally(() => u.closing.delete(job));
+          if (u.closing.size >= 8) await Promise.race(u.closing);
+        }
         u.cur = null;
+        u.flushAcks();
       }
     }
     s.lastWrite = Date.now();
   };
+  // 묶음(최대 200개)을 다 쓸 때까지 기다리지 않고 1.5초마다 저장한 파일을 알려서, 보내는 쪽 개수가 꾸준히 올라가게 함
+  u.ackAt = Date.now();
+  u.flushAcks = () => {
+    if ((!u.items.length && !u.errs.length) || Date.now() - u.ackAt < 1500) return;
+    sendAcks(p, s.sid, u.items, u.errs);
+    u.items = []; u.errs = []; u.ackAt = Date.now();
+  };
   u.finish = async () => {
+    await Promise.all([...u.closing]);   // 아직 닫는 중인 파일을 다 기다린 뒤 확인 응답
     if (u.cur && !u.cur.skip && u.left > 0) { u.cur.w.abort().catch(() => {}); u.errs.push(u.cur.raw); u.cur = null; }
     for (;;) {   // 끝에 남은 빈 파일들
       await next();
@@ -810,6 +843,7 @@ Sync.onCtrl = async (p, m) => {
       return;
     case 'sync-alive':   // 받는 쪽이 일하고 있음: 일한 양이 늘었거나 파일 하나를 3분 안쪽으로 마무리하는 중이면 기다림
       if (!mine) return;
+      sess.aliveAt = Date.now(); sess.aliveBusy = m.busy || 0;
       if (m.work !== sess.aliveWork || (m.busy > 0 && m.busy < 180)) { sess.aliveWork = m.work; sess.lastAck = Date.now(); }
       return;
     case 'sync-acks': {   // 여러 파일의 확인을 한 번에 (묶음 전송)
@@ -1006,17 +1040,44 @@ function peerRow(sess) {
     : `${esc(sess.name)} 화면에서 받을 위치를 골라야 시작돼요`;
   else if (sess.state === 'away') st = '연결 끊김 · 다시 연결되면 이어서 맞춰요';
   else if (sess.state === 'syncing' && sess.prog) {
+    // 진행은 "상대 PC가 실제로 저장한 것" 기준 (보내는 쪽은 먼저 밀어 넣고 받는 쪽은 뒤에서 저장하기 때문)
     const pg = sess.prog;
-    const secs = (performance.now() - pg.start) / 1000;
-    let tail = '';
-    if (secs > 2 && pg.bytes > 0) {   // 지금까지의 실제 속도로 남은 시간 계산
-      const rate = pg.bytes / secs;
-      const left = Math.max(0, pg.totalBytes - pg.bytes) / rate + Math.max(0, pg.total - pg.done) * PER_FILE_SEC;
-      tail = ` · 남은 시간 ${fmtDuration(left)}`;
-      const saved = Math.min(99, Math.round((1 - pg.wire / pg.bytes) * 100));
-      if (saved >= 10) tail += ` · 압축으로 ${saved}% 절약`;
+    const EQ = 256 * 1024;   // 파일 하나를 여닫는 수고를 이만큼의 용량으로 침 (작은 파일이 많을 때도 남은 시간이 맞도록)
+    const totalWork = pg.totalBytes + pg.total * EQ;
+    const work = Math.min(totalWork, pg.ackBytes + pg.done * EQ);
+    const pct = totalWork ? (work / totalWork) * 100 : 0;
+    const h = pg.hist;
+    let byteRate = 0, fileRate = 0, left = null;
+    if (h.length > 2) {
+      const [t0, b0, f0] = h[0], [t1, b1, f1] = h[h.length - 1];
+      const dt = Math.max(1, (t1 - t0) / 1000);
+      byteRate = (b1 - b0) / dt; fileRate = (f1 - f0) / dt;
+      const workRate = ((b1 - b0) + (f1 - f0) * EQ) / dt;
+      if (workRate > 0) left = (totalWork - work) / workRate;
     }
-    st = `<span class="busy">보내는 중 ${pg.done}/${pg.total}개 · ${fmtSize(pg.bytes)} / ${fmtSize(pg.totalBytes)}${tail}</span>`;
+    if (left == null && !pg.done) left = estimate(sess, pg.totalBytes, pg.total);   // 첫 확인이 오기 전에는 예상치
+    const speed = byteRate >= 1024 ? ` · 초당 ${fmtSize(byteRate)}` : fileRate >= 0.5 ? ` · 초당 ${Math.round(fileRate)}개` : '';
+    const saved = pg.bytes > 1e6 ? Math.min(99, Math.round((1 - pg.wire / pg.bytes) * 100)) : 0;
+    const tail = `${speed} · 남은 시간 ${left != null ? fmtDuration(left) : '다시 계산하는 중'}${saved >= 10 ? ` · 압축으로 ${saved}% 절약` : ''}`;
+    const idle = Math.round((Date.now() - pg.lastMove) / 1000);
+    const alive = sess.aliveAt ? Math.round((Date.now() - sess.aliveAt) / 1000) : null;
+    let now = '';
+    if (idle >= 5) {   // 잠시 진행이 없으면 무엇을 기다리는지 알려 줌
+      now = pg.phase === 'ack'
+        ? `상대 PC가 받은 파일을 저장하는 중 · 확인 기다리는 파일 ${sess.pending.size.toLocaleString()}개${sess.aliveBusy ? ` · 큰 파일 마무리 ${sess.aliveBusy}초째` : ''}`
+        : `상대 PC가 받아 가기를 기다리는 중 · ${idle}초째`;
+      now += alive != null ? ` · 상대 PC 응답 ${alive}초 전` : '';
+      if (idle >= 20) now += ' · 45초 넘게 진행이 없으면 남은 것만 자동으로 다시 보내요';
+      now = `<span class="pr-wait">${now}</span>`;
+    } else if (pg.allSent) {
+      now = `모두 보냈어요 · 상대 PC가 저장을 마치는 중 (남은 ${sess.pending.size.toLocaleString()}개)`;
+    } else if (pg.cur) {
+      now = `보내는 파일: <span class="pr-files">${esc(pg.cur.name)}</span>${pg.cur.size > 1048576 ? ` · ${fmtSize(Math.min(pg.cur.sent, pg.cur.size))} / ${fmtSize(pg.cur.size)}` : ''}`;
+    }
+    if (!pg.allSent && pg.bytes - pg.ackBytes > 1048576) now += `${now ? ' · ' : ''}보낸 양 ${fmtSize(pg.bytes)} (상대 PC가 저장하는 중)`;
+    st = `<span class="busy">보내는 중 ${pg.done.toLocaleString()}/${pg.total.toLocaleString()}개 · 저장됨 ${fmtSize(pg.ackBytes)} / ${fmtSize(pg.totalBytes)}${tail}</span>`
+      + `<span class="pr-bar" role="progressbar" aria-valuenow="${Math.round(pct)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct.toFixed(1)}%"></i></span>`
+      + (now ? `<small class="pr-now">${now}</small>` : '');
   } else if (sess.state === 'ready' && !sess.remote) st = '<span class="busy"><span class="spin"></span>상대 PC의 폴더 목록을 기다리는 중</span>';
   else if (sess.state === 'ready' && !Sync.local) st = `<span class="busy"><span class="spin"></span>${Sync.scanProg ? `내 폴더 확인 중 ${Sync.scanProg.d.toLocaleString()} / ${Sync.scanProg.n.toLocaleString()}개` : '내 폴더 확인 중…'}</span>`;   // 규칙을 바꾼 직후 등 내 목록을 다시 만드는 중
   else if (sess.state === 'ready' && d) {
