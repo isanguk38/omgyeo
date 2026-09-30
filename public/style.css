@@ -427,3 +427,17 @@ body.in-room > .top,body.in-room > .secure-note,body.in-room > .wake{flex:none;w
 #textForm #folderBtn:disabled{opacity:.45;cursor:not-allowed}
 #textForm #folderBtn svg{flex:none}
 @media (max-width:640px){#textForm #folderBtn{padding:0;width:42px}#textForm #folderBtn .fb-label{display:none}}
+/* 제외 규칙 */
+.sync-ignore{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:var(--bg)}
+.sync-ignore summary{display:flex;flex-wrap:wrap;align-items:center;gap:6px;list-style:none}
+.sync-ignore summary::-webkit-details-marker{display:none}
+.sync-ignore summary::before{content:"▸";color:var(--muted);transition:transform .15s}
+.sync-ignore[open] summary::before{transform:rotate(90deg)}
+.sync-ignore summary small{font-weight:500;color:var(--muted)}
+.sync-ignore summary code{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:1px 6px}
+.sync-ignore[open]{display:flex;flex-direction:column;gap:8px}
+.sync-ignore textarea{width:100%;min-height:120px;box-sizing:border-box;line-height:1.6}
+.sync-ignore textarea::placeholder{color:color-mix(in srgb,var(--muted) 60%,transparent)}
+.ig-foot{display:flex;align-items:center;justify-content:flex-end;gap:10px}
+.ig-dirty{font-size:12px;font-weight:600;color:var(--warn)}
+@media (prefers-reduced-motion:reduce){.sync-ignore summary::before{transition:none}}

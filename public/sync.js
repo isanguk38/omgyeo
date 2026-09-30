@@ -554,10 +554,11 @@ function drawSync() {
         <label><input type="checkbox" id="optGit" ${sh.gitignore ? 'checked' : ''}> .gitignore 규칙 따르기</label>
         <label><input type="checkbox" id="optMirror" ${sh.mirror ? 'checked' : ''}> 내 쪽에 없는 파일은 상대 쪽에서도 지우기</label>
       </div>
-      <details class="sync-ignore"${Sync.ignoreOpen ? ' open' : ''}><summary>제외 규칙</summary>
-        <p>.gitignore와 같은 문법이에요. 기본으로 .git/, node_modules/ 는 빠져요.</p>
-        <textarea id="ignoreText" rows="4" spellcheck="false" placeholder="예: dist/&#10;*.log&#10;.env">${esc(sh.ignore || '')}</textarea>
-        <button type="button" data-sa="ignore">규칙 저장</button>
+      <details class="sync-ignore"${Sync.ignoreOpen ? ' open' : ''}><summary>${ignoreSummary(sh.ignore)}</summary>
+        <p>한 줄에 규칙 하나씩 적어요. .gitignore와 같은 문법이고, .git/ 과 node_modules/ 는 기본으로 빠져요.</p>
+        <textarea id="ignoreText" rows="6" spellcheck="false" placeholder="dist/&#10;build/&#10;*.log&#10;.env&#10;!keep.log">${esc(Sync.ignoreDraft ?? sh.ignore ?? '')}</textarea>
+        <div class="ig-foot"><span class="ig-dirty" id="ignoreDirty"${Sync.ignoreDraft != null && Sync.ignoreDraft !== (sh.ignore || '') ? '' : ' hidden'}>저장 안 됨</span>
+          <button type="button" data-sa="ignore">규칙 저장</button></div>
       </details>`;
     }
     html += '</div>';
@@ -626,8 +627,11 @@ if (FS_OK) {
       case 'in-allow': return inAllow(id);
       case 'in-decline': return inDecline(id);
       case 'ignore': {
-        Sync.share.ignore = $('#ignoreText').value;
-        return saveShare().then(buildRules).then(() => { toast('제외 규칙을 저장했어요'); reoffer(); });
+        // 화면이 다시 그려져도 입력한 내용을 잃지 않도록 따로 보관해 둔 값을 저장
+        Sync.share.ignore = (Sync.ignoreDraft ?? $('#ignoreText').value).replace(/\r/g, '').trim();
+        Sync.ignoreDraft = null;
+        const n = ruleLines(Sync.share.ignore).length;
+        return saveShare().then(buildRules).then(() => { toast(n ? `제외 규칙 ${n}개를 저장했어요` : '제외 규칙을 비웠어요'); reoffer(); syncRender(); });
       }
     }
   });
@@ -640,6 +644,19 @@ if (FS_OK) {
     syncRender();
   });
   $('#syncBox').addEventListener('toggle', e => { if (e.target.classList.contains('sync-ignore')) Sync.ignoreOpen = e.target.open; }, true);
+  $('#syncBox').addEventListener('input', e => {
+    if (e.target.id !== 'ignoreText' || !Sync.share) return;
+    Sync.ignoreDraft = e.target.value;
+    $('#ignoreDirty').hidden = Sync.ignoreDraft === (Sync.share.ignore || '');
+  });
+}
+const ruleLines = text => String(text || '').split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+// 접혀 있어도 저장된 규칙이 보이도록 제목에 요약
+function ignoreSummary(text) {
+  const lines = ruleLines(text);
+  if (!lines.length) return '제외 규칙 <small>· 없음</small>';
+  const shown = lines.slice(0, 4).map(l => `<code>${esc(l)}</code>`).join(' ');
+  return `제외 규칙 <small>· ${lines.length}개</small> ${shown}${lines.length > 4 ? ` <small>외 ${lines.length - 4}개</small>` : ''}`;
 }
 // 규칙이 바뀌면 상대도 같은 규칙으로 다시 훑도록
 function reoffer() {
