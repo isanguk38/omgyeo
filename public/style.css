@@ -597,3 +597,37 @@ body.in-room > .notify-ask{flex:none}
   .in-steps,.in-merits,.in-pc,.in-uses{grid-template-columns:minmax(0,1fr)}
   .intro{gap:32px}
 }
+
+/* ---------- 사이트 정보 (홈 맨 아래, 약관·처리방침 페이지) ---------- */
+.site-foot{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;border-top:1px solid var(--line);padding-top:18px;margin-top:8px;font-size:13px;color:var(--muted)}
+.site-foot nav{display:flex;flex-wrap:wrap;gap:6px 16px}
+.site-foot a{color:var(--muted);text-decoration:none}
+.site-foot a b{color:var(--ink);font-weight:700}
+.site-foot a:hover,.site-foot a[aria-current="page"]{color:var(--ink);text-decoration:underline}
+.site-foot p{margin:0}
+
+.doc-page .logo{color:inherit;text-decoration:none}
+.doc-back{font-size:14px;font-weight:600;color:var(--muted);text-decoration:none}
+.doc-back:hover{color:var(--accent-text)}
+.doc{max-width:720px;margin:0 auto;padding-block:16px 32px;display:flex;flex-direction:column;gap:16px;font-size:15px;line-height:1.75}
+.doc h1{font-size:clamp(26px,5vw,34px);font-weight:800;letter-spacing:-.6px}
+.doc h2{font-size:18px;font-weight:800;color:var(--ink);letter-spacing:-.2px;margin-bottom:6px}
+.doc section{scroll-margin-top:16px;padding-top:8px;border-top:1px solid var(--line)}
+.doc p{margin:0 0 8px}
+.doc ul{margin:0 0 8px;padding-left:1.2em;display:flex;flex-direction:column;gap:4px}
+.doc ul ul{margin-top:4px}
+.doc a{color:var(--accent-text)}
+.doc-meta{color:var(--muted);font-size:13px;margin-top:-6px!important}
+.doc-note{color:var(--muted);font-size:13.5px}
+.doc-summary{background:var(--accent-soft);border-radius:var(--radius);padding:16px 20px}
+.doc-summary b{display:block;margin-bottom:6px}
+.doc-summary ul{margin:0}
+.doc-toc{display:flex;flex-wrap:wrap;gap:6px}
+.doc-toc a{font-size:13px;text-decoration:none;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 12px}
+.doc-toc a:hover{border-color:var(--accent)}
+.doc-table{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:8px}
+.doc-table table{border-collapse:collapse;width:100%;min-width:480px;font-size:14px;line-height:1.55}
+.doc-table th,.doc-table td{padding:10px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+.doc-table thead th{background:var(--sunk);font-size:12.5px;color:var(--muted);font-weight:600}
+.doc-table tr:last-child td{border-bottom:0}
+.doc-page > .site-foot{max-width:720px;margin:0 auto 32px}
