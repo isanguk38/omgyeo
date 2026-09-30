@@ -234,6 +234,8 @@ function onServer(m) {
       S.want = { room: m.room };
       store.set('omgyeo.last', m.room);
       if (location.search) history.replaceState(null, '', location.pathname);
+      showWaiting(false);
+      trust(m.room, m.peers.map(p => p.caps && p.caps.pid));   // 이미 방에 있던 기기는 신뢰
       showRoom(m.room);
       for (const p of m.peers) addPeer(p, true);
       remember();
@@ -241,6 +243,7 @@ function onServer(m) {
       renderPair(); renderPeers();
       break;
     case 'peer-joined':
+      trust(S.room, [m.peer.caps && m.peer.caps.pid]);   // 누군가 허용해서 들어온 기기
       addPeer(m.peer, false);
       remember(); renderPeers();
       break;
@@ -256,9 +259,13 @@ function onServer(m) {
       break;
     }
     case 'signal': onSignal(m.from, m.data); break;
+    case 'waiting': showWaiting(true); break;
+    case 'join-request': onJoinRequest(m); break;
+    case 'join-done': onJoinDone(m); break;
+    case 'join-denied': onJoinDenied(m); break;
     case 'error':
-      toast(m.message, 3500);
-      if (m.code === 'nocode') { S.want = null; $('#codeInput').select(); }
+      toast(m.message, 4000);
+      if (m.code === 'nocode' || m.code === 'blocked') { S.want = null; $('#codeInput').select(); }
       break;
   }
 }
@@ -1237,6 +1244,7 @@ function updateItem(it) {
     const speed = (it.done - (it.startDone || 0)) / Math.max(secs, 0.001);
     sz = `${fmtSize(it.done)} / ${fmtSize(it.size)}`;
     if (secs > 0.5) sz += ` · ${fmtSize(speed)}/s`;
+    if (secs > 2 && speed > 0 && typeof fmtDuration === 'function') sz += ` · 남은 시간 ${fmtDuration((it.size - it.done) / speed)}`;
     if (it.kind === 'bundle') sz = `${it.doneCount}/${it.count}개 · ${sz}`;
   } else if (it.state === 'paused' && it.size) sz = `${Math.floor(pct)}%에서 멈춤 · ${fmtSize(it.size)}`;
   if (it.resumed && it.state !== 'done') sz += it.dir === 'out' ? ' · 이어서 보내는 중' : ' · 이어받는 중';
@@ -1678,6 +1686,78 @@ document.addEventListener('click', async e => {
   if (b.dataset.keep === 'ok') { store.set('omgyeo.keepDays', Number(box.dataset.days)); renderKeep(); await cleanupOld(); }
   else renderKeep();
 });
+
+// ---------- 새 기기 입장 승인 ----------
+// 방에 이미 기기가 있으면 새 기기는 허용을 받아야 들어옴. 한 번 허용했거나 같은 방에서 만난 기기는
+// 다음부터 자동으로 허용(이 브라우저에 방별로 기억).
+const KIND_LABEL = { pc: 'PC', phone: '폰', tablet: '태블릿' };
+function trustList() { return store.get('omgyeo.trust', {}); }
+function isTrusted(room, pid) { return !!(room && pid && (trustList()[room] || []).includes(pid)); }
+function trust(room, pids) {
+  if (!room) return;
+  const all = trustList();
+  const set = new Set(all[room] || []);
+  for (const pid of pids) if (pid && pid !== PERSIST_ID) set.add(pid);
+  all[room] = [...set].slice(-50);
+  // 오래된 방은 정리 (최근 연결 목록에 없는 방)
+  const recent = new Set(store.get('omgyeo.recent', []).map(r => r.room));
+  for (const r of Object.keys(all)) if (r !== room && !recent.has(r)) delete all[r];
+  store.set('omgyeo.trust', all);
+}
+function onJoinRequest(m) {
+  const peer = m.peer || {};
+  const pid = peer.caps && peer.caps.pid;
+  if (isTrusted(S.room, pid)) {   // 전에 허용한 기기는 묻지 않고 통과
+    sendServer({ type: 'join-answer', reqId: m.reqId, allow: true });
+    return;
+  }
+  const box = document.createElement('div');
+  box.className = 'join-req';
+  box.dataset.req = m.reqId;
+  box.innerHTML = `<span class="jr-ic">${ICONS[peer.kind] || ICONS.pc}</span>
+    <div class="jr-text"><b></b><span>허용하면 이 연결에서 파일과 글을 주고받을 수 있어요. 모르는 기기라면 거절하세요.</span>
+      <label><input type="checkbox" checked> 다음부터 이 기기는 묻지 않고 허용</label></div>
+    <div class="jr-btns"><button type="button" class="solid" data-jr="allow">허용</button><button type="button" data-jr="deny">거절</button></div>`;
+  box.querySelector('b').textContent = `${peer.name || '새 기기'} (${KIND_LABEL[peer.kind] || '기기'})이(가) 들어오려고 해요`;
+  box.querySelector('[data-jr="allow"]').onclick = () => {
+    if (box.querySelector('input').checked) trust(S.room, [pid]);
+    sendServer({ type: 'join-answer', reqId: m.reqId, allow: true });
+    box.remove();
+  };
+  box.querySelector('[data-jr="deny"]').onclick = () => {
+    sendServer({ type: 'join-answer', reqId: m.reqId, allow: false });
+    box.remove();
+    toast('들어오려던 기기를 거절했어요');
+  };
+  $('#joinReqs').appendChild(box);
+  announce('새 기기가 들어오려고 해요', `${peer.name || '새 기기'} · 옮겨에서 허용하거나 거절해 주세요`);
+}
+function onJoinDone(m) {
+  const box = document.querySelector(`.join-req[data-req="${m.reqId}"]`);
+  if (box) box.remove();   // 다른 기기가 먼저 답했거나 요청이 취소됨
+}
+function showWaiting(on) {
+  $('#waitBox').hidden = !on;
+  if (on) show('home');
+}
+$('#waitCancel').onclick = () => {
+  sendServer({ type: 'leave' });
+  S.want = null;
+  store.del('omgyeo.last');
+  showWaiting(false);
+  toast('입장 요청을 취소했어요');
+};
+function onJoinDenied(m) {
+  showWaiting(false);
+  S.want = null;
+  store.del('omgyeo.last');
+  const msg = {
+    denied: '상대 기기가 입장을 거절했어요.',
+    timeout: '상대 기기에서 2분 동안 허용하지 않아 요청이 취소됐어요. 상대 화면이 열려 있는지 확인하고 다시 시도하세요.',
+    empty: '연결에 있던 기기가 모두 나가서 들어갈 수 없어요. 새로 연결해 주세요.',
+  }[m.reason] || '입장하지 못했어요.';
+  toast(msg, 5000);
+}
 
 // ---------- 시작 ----------
 (async function start() {

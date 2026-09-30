@@ -185,6 +185,55 @@ function diff(sess) {
 const hasWork = sess => sess.diff && (sess.diff.send.length || (Sync.share.mirror && sess.diff.extra.length));
 function autoPush(sess) { if (Sync.share.auto && sess.state === 'ready' && hasWork(sess)) push(sess); }
 
+// 보낼 단위: 64KB 넘는 파일은 하나씩, 작은 파일은 최대 1MB·200개씩 한 묶음으로
+// 텍스트 계열은 보내는 동안 gzip으로 압축하고 받는 쪽이 받으면서 풀어서 원래 파일로 씀
+const SYNC_SMALL = 64 * 1024, SYNC_BATCH_BYTES = 1024 * 1024, SYNC_BATCH_COUNT = 200;
+const ZIP_OK = typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
+const compressible = path => isTextPath(path);
+function planUnits(list) {
+  const units = [];
+  let batch = null;
+  for (const path of list) {
+    const ent = Sync.local.get(path);
+    if (!ent) continue;
+    if (ent.size <= SYNC_SMALL) {
+      if (!batch) batch = { files: [], bytes: 0 };
+      batch.files.push(path); batch.bytes += ent.size;
+      if (batch.bytes >= SYNC_BATCH_BYTES || batch.files.length >= SYNC_BATCH_COUNT) { units.push(batch); batch = null; }
+    } else {
+      if (batch) { units.push(batch); batch = null; }
+      units.push({ single: path });
+    }
+  }
+  if (batch) units.push(batch);
+  return units;
+}
+// 예상 시간: 지난번 실제 속도(없으면 연결 경로별 기본값) + 파일 수에 따른 쓰기 시간
+const RATE_DEFAULT = { lan: 40e6, direct: 10e6, turn: 5e6, relay: 1.5e6 };
+const PER_FILE_SEC = 0.004;
+function pathKind(p) { return !p ? 'relay' : p.mode === 'p2p' ? (p.path || 'direct') : 'relay'; }
+function knownRate(sess) {
+  const p = S.peers.get(sess.peerId);
+  const saved = store.get('omgyeo.rates', {})[`${sess.pid}:${pathKind(p)}`];
+  return saved || RATE_DEFAULT[pathKind(p)] || RATE_DEFAULT.relay;
+}
+function saveRate(sess, rate) {
+  if (!rate || !isFinite(rate)) return;
+  const p = S.peers.get(sess.peerId);
+  const all = store.get('omgyeo.rates', {});
+  const key = `${sess.pid}:${pathKind(p)}`;
+  all[key] = all[key] ? all[key] * 0.5 + rate * 0.5 : rate;
+  store.set('omgyeo.rates', all);
+}
+function fmtDuration(sec) {
+  sec = Math.max(1, Math.round(sec));
+  if (sec < 60) return `약 ${sec}초`;
+  if (sec < 3600) { const m = Math.floor(sec / 60), s = sec % 60; return s >= 10 && m < 10 ? `약 ${m}분 ${Math.round(s / 10) * 10}초` : `약 ${Math.round(sec / 60)}분`; }
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return `약 ${h}시간${m ? ` ${m}분` : ''}`;
+}
+function estimate(sess, bytes, files) { return bytes / knownRate(sess) + files * PER_FILE_SEC; }
+
 async function push(sess) {
   const p = S.peers.get(sess.peerId);
   if (!p || sess.state !== 'ready' || !hasWork(sess)) return;
@@ -192,7 +241,7 @@ async function push(sess) {
   const list = [...sess.diff.send];
   const dels = Sync.share.mirror ? [...sess.diff.extra] : [];
   sess.state = 'syncing';
-  sess.prog = { done: 0, total: list.length, bytes: 0, totalBytes: sess.diff.bytes, errors: 0, start: performance.now(), files: [], diffs: {}, status: new Map(sess.diff.status) };
+  sess.prog = { done: 0, total: list.length, bytes: 0, wire: 0, totalBytes: sess.diff.bytes, errors: 0, start: performance.now(), files: [], diffs: {}, status: new Map(sess.diff.status) };
   sess.inflight = 0; sess.pending.clear();
   sess.lastAck = Date.now();
   syncRender();
@@ -206,45 +255,84 @@ async function push(sess) {
       if (Date.now() - Math.max(sess.lastAck, started) > SYNC_STALL) throw new Error('stalled');
     }
   };
+  // 원본 바이트 스트림을 (필요하면 압축해서) 조각으로 보냄. 진행률은 원본 기준으로 셈
+  const streamOut = async (how, fid, source, zip) => {
+    const chunk = how === 'dc' ? CHUNK_DC : CHUNK_WS;
+    const counter = new TransformStream({ transform(c, ctl) { sess.prog.bytes += c.byteLength; ctl.enqueue(c); } });
+    let stream = source.pipeThrough(counter);
+    if (zip) stream = stream.pipeThrough(new CompressionStream('gzip'));
+    const reader = stream.getReader();
+    let last = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const u8 = value instanceof Uint8Array ? value : new Uint8Array(value);
+        for (let i = 0; i < u8.length; i += chunk) {
+          if (sess.cancelled) throw new Error('cancelled');
+          const piece = u8.subarray(i, i + chunk);
+          const frame = await frameChunk(p, fid, piece);
+          await drain(p, how);
+          if (!canSend(p, how)) throw new Error('closed');
+          rawSend(p, how, frame);
+          sess.prog.wire += piece.length;
+        }
+        if (performance.now() - last > 250) { last = performance.now(); syncRender(); }
+      }
+    } catch (err) { reader.cancel().catch(() => {}); throw err; }
+  };
+  const track = (path, size) => { const w = Math.max(size, 1); sess.inflight += w; sess.pending.set(path, w); };
+  const fresh = async path => {   // 훑은 뒤 또 바뀐 파일은 해시를 다시 계산
+    const ent = Sync.local.get(path);
+    if (!ent) return null;
+    let file;
+    try { file = await ent.handle.getFile(); } catch { return null; }
+    const hash = file.size !== ent.size || file.lastModified !== ent.mtime ? await hashFile(file) : ent.hash;
+    return { file, hash };
+  };
   let stalled = false;
   try {
     await p.keyP;
     if (dels.length) await sendCtrl(p, { t: 'sync-del', sid, paths: dels });
-    for (const path of list) {
-      const ent = Sync.local.get(path);
-      if (!ent) { sess.prog.total--; continue; }
-      let file;
-      try { file = await ent.handle.getFile(); } catch { sess.prog.total--; continue; }
-      let hash = ent.hash;
-      if (file.size !== ent.size || file.lastModified !== ent.mtime) hash = await hashFile(file);   // 훑은 뒤 또 바뀐 파일
+    for (const u of planUnits(list)) {
       await waitAcks(() => sess.inflight <= SYNC_WINDOW);
       if (!aliveNow()) throw new Error('peer gone');
       const how = via(p);
-      const chunk = how === 'dc' ? CHUNK_DC : CHUNK_WS;
       const fid = S.fidSeq++;
-      await sendCtrl(p, { t: 'sync-file', sid, fid, path, size: file.size, hash }, how);
-      const weight = Math.max(file.size, 1);
-      sess.inflight += weight;
-      sess.pending.set(path, weight);
-      for (let off = 0; off < file.size; off += READ_BLOCK) {
-        const block = new Uint8Array(await file.slice(off, off + READ_BLOCK).arrayBuffer());
-        for (let i = 0; i < block.length; i += chunk) {
-          if (sess.cancelled) throw new Error('cancelled');
-          const frame = await frameChunk(p, fid, block.subarray(i, i + chunk));
-          await drain(p, how);
-          if (!canSend(p, how)) throw new Error('closed');
-          rawSend(p, how, frame);
+      if (u.single) {
+        const f = await fresh(u.single);
+        if (!f) { sess.prog.total--; continue; }
+        const zip = ZIP_OK && compressible(u.single) && f.file.size >= 4096;
+        await sendCtrl(p, { t: 'sync-file', sid, fid, path: u.single, size: f.file.size, hash: f.hash, z: zip ? 'gzip' : undefined }, how);
+        track(u.single, f.file.size);
+        await streamOut(how, fid, f.file.stream(), zip);
+        if (zip) await sendCtrl(p, { t: 'sync-end', sid, fid }, how);
+      } else {
+        const files = [], blobs = [];
+        for (const path of u.files) {
+          const f = await fresh(path);
+          if (!f) { sess.prog.total--; continue; }
+          files.push({ path, size: f.file.size, hash: f.hash }); blobs.push(f.file);
         }
-        sess.prog.bytes += block.length;
-        syncRender();
+        if (!files.length) continue;
+        const bytes = files.reduce((a, f) => a + f.size, 0);
+        const zip = ZIP_OK && bytes >= 2048 && files.some(f => compressible(f.path));
+        await sendCtrl(p, { t: 'sync-batch', sid, fid, files, z: zip ? 'gzip' : undefined }, how);
+        for (const f of files) track(f.path, f.size);
+        if (bytes) await streamOut(how, fid, new Blob(blobs).stream(), zip);
+        if (zip || !bytes) await sendCtrl(p, { t: 'sync-end', sid, fid }, how);
       }
     }
     // 마지막 파일들의 확인을 기다림
     await waitAcks(() => !sess.pending.size);
     if (!aliveNow()) throw new Error('peer gone');
     const n = sess.prog.done;
+    const secs = (performance.now() - sess.prog.start) / 1000;
+    if (secs > 3 && sess.prog.bytes > 1e6) saveRate(sess, sess.prog.bytes / Math.max(secs - n * PER_FILE_SEC, 0.5));
     sess.retries = 0;
-    toast(sess.prog.errors ? `${n}개 보냄 · ${sess.prog.errors}개 실패` : `${sess.name}에 변경 ${n}개를 보냈어요`);
+    const saved = sess.prog.bytes ? Math.round((1 - sess.prog.wire / sess.prog.bytes) * 100) : 0;
+    toast(sess.prog.errors ? `${n}개 보냄 · ${sess.prog.errors}개 실패`
+      : `${sess.name}에 변경 ${n}개를 보냈어요 (${fmtDuration(secs).replace('약 ', '')}${saved >= 10 ? ` · 압축으로 ${saved}% 절약` : ''})`, 4000);
   } catch (err) {
     console.warn('push', err);
     stalled = aliveNow();
@@ -270,6 +358,17 @@ async function push(sess) {
       toast('상대 PC가 응답하지 않아 멈췄어요. 상대 화면이 열려 있는지 확인하고 공유하기를 다시 눌러 주세요.', 5000);
     }
   }
+}
+function onAckItem(sess, it, ok) {
+  sess.lastAck = Date.now();
+  if (ok && sess.remote) sess.remote.set(it.path, [it.size, it.hash]);
+  if (ok && sess.prog) {
+    sess.prog.files.push([it.path, it.st || sess.prog.status.get(it.path) || 'M', it.size, it.adds ?? null, it.dels ?? null]);
+    if (it.diff) sess.prog.diffs[it.path] = it.diff;
+  }
+  const w = sess.pending.get(it.path);
+  if (w != null) { sess.pending.delete(it.path); sess.inflight -= w; }
+  if (sess.prog) { if (ok) sess.prog.done++; else sess.prog.errors++; }
 }
 function wakeAll(sess) { for (const r of sess.wake.splice(0)) r(); }
 
@@ -340,87 +439,184 @@ async function inIndex(s) {
     if (!(await fsPermission(s.handle, 'readwrite', false))) { s.state = 'perm'; syncRender(); }
   } finally { s.indexing = false; }
 }
-async function inFile(p, m) {
-  const s = Sync.inbound.get(m.sid);
-  const path = safePath(m.path);
-  const fail = msg => sendCtrl(p, { t: 'sync-err', sid: m.sid, path: m.path, msg }).catch(() => {});
-  if (!s || !['ready', 'receiving'].includes(s.state)) return fail('not ready');
-  if (!path || isIgnored(s.rules, path, false)) return fail('bad path');
+// 받는 단위(unit): 큰 파일 하나(single) 또는 작은 파일 묶음(batch). 압축돼 오면 받으면서 풀어서 씀
+function abortUnit(u) {
+  if (u.st && u.st.w) u.st.w.abort().catch(() => {});
+  if (u.cur && u.cur.w) u.cur.w.abort().catch(() => {});
+  if (u.zw) u.zw.abort().catch(() => {});
+}
+async function openRecv(s, rawPath, size, hash) {
+  const path = safePath(rawPath);
+  if (!path || isIgnored(s.rules, path, false)) throw new Error('bad path');
   s.lastWrite = Date.now();
-  for (const [key, old] of Sync.fidMap) {   // 멈췄다가 다시 보내는 경우: 같은 파일의 쓰다 만 것을 정리
-    if (old.s === s && old.path === path) {
-      Sync.fidMap.delete(key);
-      old.w.abort().catch(() => {});
-      s.receiving = Math.max(0, s.receiving - 1);
+  for (const [key, old] of Sync.fidMap) {   // 멈췄다가 다시 보내는 경우: 같은 파일을 쓰던 단위를 정리
+    if (old.s === s && ((old.st && old.st.path === path) || (old.cur && old.cur.path === path))) {
+      Sync.fidMap.delete(key); abortUnit(old); unitDone(s);
     }
   }
+  let existed = false, oldText = null;
   try {
-    let existed = false, oldText = null;
-    try {
-      const old = await (await fileHandleAt(s.handle, path, false)).getFile();
-      existed = true;
-      if (isTextPath(path)) oldText = await readTextMaybe(old);
-    } catch {}
-    const fh = await fileHandleAt(s.handle, path, true);
-    const w = await fh.createWritable();   // 다 쓰고 닫을 때 한 번에 바뀜 (쓰는 중에 파일이 깨지지 않음)
-    const st = { s, path, fh, w, size: Number(m.size) || 0, hash: String(m.hash), done: 0, status: existed ? 'M' : 'A', existed, oldText };
-    s.receiving++; s.state = 'receiving';
-    if (st.size === 0) return inFinish(p, st);
-    Sync.fidMap.set(`${p.id}:${m.fid}`, st);
-    syncRender();
-  } catch (err) {
-    console.warn('sync write', err);
-    fail(err.message);
+    const old = await (await fileHandleAt(s.handle, path, false)).getFile();
+    existed = true;
+    if (isTextPath(path)) oldText = await readTextMaybe(old);
+  } catch {}
+  const fh = await fileHandleAt(s.handle, path, true);
+  const w = await fh.createWritable();   // 다 쓰고 닫을 때 한 번에 바뀜 (쓰는 중에 파일이 깨지지 않음)
+  return { s, path, raw: String(rawPath), fh, w, size, hash: String(hash), status: existed ? 'M' : 'A', existed, oldText };
+}
+// 파일을 닫고 캐시·히스토리에 반영. 확인 응답에 넣을 내용을 돌려줌
+async function closeRecv(st) {
+  const s = st.s;
+  await st.w.close();
+  const file = await st.fh.getFile();
+  if (!s.cache) s.cache = (await idb.get('hash', `recv:${s.sid}`)) || {};
+  s.cache[st.path] = [file.size, file.lastModified, st.hash];   // 받은 파일은 다시 해시하지 않도록
+  clearTimeout(s.cacheTimer); s.cacheTimer = setTimeout(() => flushCache(s), 1000);
+  s.count++; s.applied++; s.last = Date.now();
+  let d = null;
+  if (isTextPath(st.path) && (!st.existed || st.oldText != null)) {
+    const newText = await readTextMaybe(file);
+    if (newText != null) d = lineDiff(st.existed ? st.oldText : '', newText);
   }
+  if (!s.batch) s.batch = { files: [], diffs: {} };
+  s.batch.files.push([st.path, st.status, st.size, d ? d.adds : null, d ? d.dels : null]);
+  if (d && d.hunks) s.batch.diffs[st.path] = d.hunks;
+  return { path: st.raw, size: st.size, hash: st.hash, st: st.status, adds: d ? d.adds : null, dels: d ? d.dels : null, diff: d ? d.hunks : null };
+}
+// 확인 응답 보내기. 바뀐 줄이 너무 많으면 한 메시지가 커지지 않도록 뒤쪽은 줄 비교 없이 보냄
+function sendAcks(p, sid, items, errs) {
+  let budget = 700 * 1024;
+  for (const it of items) { const n = it.diff ? it.diff.length : 0; if (n > budget) it.diff = null; else budget -= n; }
+  sendCtrl(p, { t: 'sync-acks', sid, items, errs }).catch(() => {});
+}
+function unitStart(s) { s.receiving++; s.state = 'receiving'; }
+function unitDone(s) {
+  s.receiving = Math.max(0, s.receiving - 1);
+  if (s.receiving) return;
+  s.state = 'ready';
+  clearTimeout(s.doneTimer);
+  s.doneTimer = setTimeout(() => {
+    saveBatch(s);
+    if (!s.applied) return;
+    announce(`'${s.name}' 폴더 업데이트`, `${s.peerName}에서 변경 ${s.applied}개가 적용됐어요`);
+    s.applied = 0;
+  }, 1500);
+}
+// 압축돼 오는 경우: 받은 조각을 풀어서 sink로 넘김
+function gunzipInto(u) {
+  const ds = new DecompressionStream('gzip');
+  u.zw = ds.writable.getWriter();
+  u.pump = (async () => {
+    const r = ds.readable.getReader();
+    for (;;) { const { done, value } = await r.read(); if (done) break; await u.sink(value); }
+  })();
+  u.pump.catch(() => {});
+}
+async function inFile(p, m) {
+  const s = Sync.inbound.get(m.sid);
+  if (!s || !['ready', 'receiving'].includes(s.state)) return sendAcks(p, m.sid, [], [m.path]);
+  let st;
+  try { st = await openRecv(s, m.path, Number(m.size) || 0, m.hash); } catch (err) { console.warn('sync open', err); return sendAcks(p, m.sid, [], [m.path]); }
+  unitStart(s);
+  const u = { kind: 'single', s, p, st, got: 0, total: st.size, z: m.z === 'gzip', failed: false };
+  u.sink = async bytes => {
+    if (u.failed) return;
+    try { await st.w.write(bytes); s.lastWrite = Date.now(); } catch (err) { u.failed = true; st.w.abort().catch(() => {}); }
+  };
+  u.finish = async () => {
+    if (u.failed) return sendAcks(p, s.sid, [], [st.raw]);
+    try { sendAcks(p, s.sid, [await closeRecv(st)], []); } catch { sendAcks(p, s.sid, [], [st.raw]); }
+  };
+  if (u.z) gunzipInto(u);
+  if (!u.z && u.total === 0) { await u.finish(); return unitDone(s); }
+  Sync.fidMap.set(`${p.id}:${m.fid}`, u);
+  syncRender();
+}
+async function inBatch(p, m) {
+  const s = Sync.inbound.get(m.sid);
+  const files = (Array.isArray(m.files) ? m.files : []).slice(0, 1000).map(f => ({ path: String(f.path || ''), size: Math.max(0, Number(f.size) || 0), hash: String(f.hash || '') }));
+  if (!s || !['ready', 'receiving'].includes(s.state)) return sendAcks(p, m.sid, [], files.map(f => f.path));
+  unitStart(s);
+  const u = { kind: 'batch', s, p, files, idx: 0, cur: null, left: 0, items: [], errs: [], got: 0, total: files.reduce((a, f) => a + f.size, 0), z: m.z === 'gzip' };
+  // 다음 파일 열기 (빈 파일은 바로 닫음)
+  const next = async () => {
+    while (u.idx < files.length) {
+      const f = files[u.idx++];
+      try {
+        const st = await openRecv(s, f.path, f.size, f.hash);
+        if (f.size === 0) { u.items.push(await closeRecv(st)); continue; }
+        u.cur = st; u.left = f.size; return;
+      } catch {
+        u.errs.push(f.path);
+        if (f.size) { u.cur = { skip: true, raw: f.path }; u.left = f.size; return; }
+      }
+    }
+    u.cur = null;
+  };
+  // 이어진 바이트를 파일 크기대로 잘라서 각 파일에 씀
+  u.sink = async bytes => {
+    let off = 0;
+    while (off < bytes.length) {
+      if (!u.cur) { await next(); if (!u.cur) break; }
+      const n = Math.min(u.left, bytes.length - off);
+      if (!u.cur.skip) {
+        try { await u.cur.w.write(bytes.subarray(off, off + n)); }
+        catch { u.cur.w.abort().catch(() => {}); u.errs.push(u.cur.raw); u.cur = { skip: true, raw: u.cur.raw }; }
+      }
+      off += n; u.left -= n;
+      if (u.left === 0) {
+        if (!u.cur.skip) { try { u.items.push(await closeRecv(u.cur)); } catch { u.errs.push(u.cur.raw); } }
+        u.cur = null;
+      }
+    }
+    s.lastWrite = Date.now();
+  };
+  u.finish = async () => {
+    if (u.cur && !u.cur.skip && u.left > 0) { u.cur.w.abort().catch(() => {}); u.errs.push(u.cur.raw); u.cur = null; }
+    for (;;) {   // 끝에 남은 빈 파일들
+      await next();
+      if (!u.cur) break;
+      if (!u.cur.skip) u.cur.w.abort().catch(() => {});
+      if (!u.errs.includes(u.cur.raw)) u.errs.push(u.cur.raw);
+      u.cur = null;
+    }
+    sendAcks(p, s.sid, u.items, u.errs);
+  };
+  if (u.z) gunzipInto(u);
+  if (!u.z && u.total === 0) { Sync.fidMap.set(`${p.id}:${m.fid}`, u); return; }   // 끝 신호(sync-end)에서 마무리
+  Sync.fidMap.set(`${p.id}:${m.fid}`, u);
+  syncRender();
+}
+async function completeUnit(key, u) {
+  Sync.fidMap.delete(key);
+  try {
+    if (u.z) { await u.zw.close(); await u.pump; }
+  } catch (err) {
+    console.warn('gunzip', err);
+    abortUnit(u);
+    if (u.kind === 'single') u.failed = true;
+    else { if (u.cur && !u.cur.skip) u.errs.push(u.cur.raw); u.cur = null; u.idx = u.files.length; }
+  }
+  await u.finish();
+  unitDone(u.s);
+  syncRender();
 }
 Sync.onChunk = async (p, fid, data) => {
   const key = `${p.id}:${fid}`;
-  const st = Sync.fidMap.get(key);
-  if (!st) return;
-  try { await st.w.write(data); } catch (err) {
-    Sync.fidMap.delete(key);
-    st.w.abort().catch(() => {});
-    st.s.receiving--; if (!st.s.receiving) st.s.state = 'ready';
-    sendCtrl(p, { t: 'sync-err', sid: st.s.sid, path: st.path, msg: err.message }).catch(() => {});
-    return;
+  const u = Sync.fidMap.get(key);
+  if (!u) return;
+  u.got += data.length;
+  if (u.z) {
+    try { await u.zw.write(data); } catch {}
+    return;   // 압축은 끝 신호(sync-end)에서 마무리
   }
-  st.done += data.length;
-  st.s.lastWrite = Date.now();
-  if (st.done >= st.size) { Sync.fidMap.delete(key); await inFinish(p, st); }
+  await u.sink(data);
+  if (u.got >= u.total) await completeUnit(key, u);
 };
-async function inFinish(p, st) {
-  const s = st.s;
-  try {
-    await st.w.close();
-    const file = await st.fh.getFile();
-    if (!s.cache) s.cache = (await idb.get('hash', `recv:${s.sid}`)) || {};
-    s.cache[st.path] = [file.size, file.lastModified, st.hash];   // 받은 파일은 다시 해시하지 않도록
-    clearTimeout(s.cacheTimer); s.cacheTimer = setTimeout(() => flushCache(s), 1000);
-    s.count++; s.applied++; s.last = Date.now();
-    let d = null;
-    if (isTextPath(st.path) && (!st.existed || st.oldText != null)) {
-      const newText = await readTextMaybe(file);
-      if (newText != null) d = lineDiff(st.existed ? st.oldText : '', newText);
-    }
-    if (!s.batch) s.batch = { files: [], diffs: {} };
-    s.batch.files.push([st.path, st.status, st.size, d ? d.adds : null, d ? d.dels : null]);
-    if (d && d.hunks) s.batch.diffs[st.path] = d.hunks;
-    sendCtrl(p, { t: 'sync-ack', sid: s.sid, path: st.path, size: st.size, hash: st.hash, st: st.status, adds: d ? d.adds : null, dels: d ? d.dels : null, diff: d ? d.hunks : null }).catch(() => {});
-  } catch (err) {
-    sendCtrl(p, { t: 'sync-err', sid: s.sid, path: st.path, msg: err.message }).catch(() => {});
-  }
-  s.receiving--;
-  if (!s.receiving) {
-    s.state = 'ready';
-    clearTimeout(s.doneTimer);
-    s.doneTimer = setTimeout(() => {
-      saveBatch(s);
-      if (!s.applied) return;
-      announce(`'${s.name}' 폴더 업데이트`, `${s.peerName}에서 변경 ${s.applied}개가 적용됐어요`);
-      s.applied = 0;
-    }, 1500);
-  }
-  syncRender();
+async function inEnd(p, m) {
+  const key = `${p.id}:${m.fid}`;
+  const u = Sync.fidMap.get(key);
+  if (u) await completeUnit(key, u);
 }
 async function flushCache(s) {
   if (!s.cache) return;
@@ -450,7 +646,7 @@ function inStop(sid, notify) {
   const s = Sync.inbound.get(sid);
   if (!s) return;
   clearInterval(s.timer);
-  for (const [key, st] of Sync.fidMap) if (st.s === s) { Sync.fidMap.delete(key); st.w.abort().catch(() => {}); }
+  for (const [key, u] of Sync.fidMap) if (u.s === s) { Sync.fidMap.delete(key); abortUnit(u); }
   flushCache(s);
   Sync.inbound.delete(sid);
   if (notify) toast(`${s.peerName}이(가) '${s.name}' 폴더 공유를 멈췄어요`);
@@ -473,6 +669,8 @@ Sync.onCtrl = async (p, m) => {
     // 받는 쪽
     case 'sync-offer': return inOffer(p, m);
     case 'sync-file': return inFile(p, m);
+    case 'sync-batch': return inBatch(p, m);
+    case 'sync-end': return inEnd(p, m);
     case 'sync-del': return inDel(p, m);
     case 'sync-stop': return inStop(m.sid, true);
     case 'sync-peek': return inPeek(p, m);
@@ -491,6 +689,14 @@ Sync.onCtrl = async (p, m) => {
         syncRender();
       }
       return;
+    case 'sync-acks': {   // 여러 파일의 확인을 한 번에 (묶음 전송)
+      if (!mine) return;
+      for (const it of (m.items || [])) onAckItem(sess, it, true);
+      for (const path of (m.errs || [])) onAckItem(sess, { path }, false);
+      wakeAll(sess);
+      syncRender();
+      return;
+    }
     case 'sync-ack':
     case 'sync-err': {
       if (!mine) return;
@@ -526,11 +732,11 @@ Sync.onPeerJoined = p => {
 };
 Sync.onPeerLeft = p => {
   for (const sess of Sync.sessions.values()) if (sess.peerId === p.id) { sess.state = 'away'; wakeAll(sess); }
-  for (const [key, st] of Sync.fidMap) {
+  for (const [key, u] of Sync.fidMap) {
     if (!key.startsWith(`${p.id}:`)) continue;
-    st.w.abort().catch(() => {});   // 쓰다 만 파일은 원래 내용 그대로 둠
+    abortUnit(u);   // 쓰다 만 파일은 원래 내용 그대로 둠
     Sync.fidMap.delete(key);
-    st.s.receiving = Math.max(0, st.s.receiving - 1);
+    u.s.receiving = Math.max(0, u.s.receiving - 1);
   }
   for (const s of Sync.inbound.values()) if (s.peerId === p.id) { s.state = 'away'; clearInterval(s.timer); flushCache(s); }
   syncRender();
@@ -633,11 +839,20 @@ function peerRow(sess) {
   else if (sess.state === 'away') st = '연결 끊김 · 다시 연결되면 이어서 맞춰요';
   else if (sess.state === 'syncing' && sess.prog) {
     const pg = sess.prog;
-    st = `<span class="busy">보내는 중 ${pg.done}/${pg.total}개 · ${fmtSize(pg.bytes)} / ${fmtSize(pg.totalBytes)}</span>`;
+    const secs = (performance.now() - pg.start) / 1000;
+    let tail = '';
+    if (secs > 2 && pg.bytes > 0) {   // 지금까지의 실제 속도로 남은 시간 계산
+      const rate = pg.bytes / secs;
+      const left = Math.max(0, pg.totalBytes - pg.bytes) / rate + Math.max(0, pg.total - pg.done) * PER_FILE_SEC;
+      tail = ` · 남은 시간 ${fmtDuration(left)}`;
+      const saved = Math.round((1 - pg.wire / pg.bytes) * 100);
+      if (saved >= 10) tail += ` · 압축으로 ${saved}% 절약`;
+    }
+    st = `<span class="busy">보내는 중 ${pg.done}/${pg.total}개 · ${fmtSize(pg.bytes)} / ${fmtSize(pg.totalBytes)}${tail}</span>`;
   } else if (sess.state === 'ready' && !sess.remote) st = '상대 폴더 확인 중…';
   else if (sess.state === 'ready' && d) {
     const parts = [];
-    if (d.send.length) parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개 · ${fmtSize(d.bytes)}`);
+    if (d.send.length) parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개 · ${fmtSize(d.bytes)} · ${fmtDuration(estimate(sess, d.bytes, d.send.length))}`);
     if (Sync.share.mirror && d.extra.length) parts.push(`지울 파일 ${d.extra.length}개`);
     st = parts.length ? parts.join(' · ') : '<span class="ok">✓ 같아요</span>';
     if (!Sync.share.mirror && d.extra.length && !d.send.length) st += ` <small>(상대 쪽에만 있는 파일 ${d.extra.length}개)</small>`;

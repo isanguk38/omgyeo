@@ -126,11 +126,12 @@ const server = hasCert
   : http.createServer(handle);
 
 // ---------- 방과 기기 ----------
-const rooms = new Map();   // roomId -> { peers: Map<id, ws>, code }
+const rooms = new Map();   // roomId -> { peers: Map<id, ws>, code, pending: Map<reqId, {ws, timer}> }
 const codes = new Map();   // 6자리 코드 -> roomId
 const ID_CHARS = 'abcdefghijkmnpqrstuvwxyz23456789';
 const randomId = n => Array.from(crypto.randomBytes(n), b => ID_CHARS[b % ID_CHARS.length]).join('');
 const ROOM_RE = /^[a-z0-9]{10}$/;
+const APPROVAL_WAIT = 120000;   // 입장 승인을 기다리는 최대 시간
 
 function newCode() {
   for (let i = 0; i < 50; i++) {
@@ -140,16 +141,72 @@ function newCode() {
   return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 }
 // pub: 종단간 암호화용 공개키(서버는 전달만 함), dev: 페이지가 살아 있는 동안 유지되는 기기 식별자(이어받기용)
-// caps: 기기 능력(fs: 폴더 읽고 쓰기 가능, pid: 브라우저 고유 표식 — 폴더 동기화 짝 기억용)
+// caps: 기기 능력(fs: 폴더 읽고 쓰기 가능, pid: 브라우저 고유 표식 — 폴더 동기화 짝·신뢰 기기 기억용)
 const info = ws => ({ id: ws.id, name: ws.name, kind: ws.kind, pub: ws.pub, dev: ws.dev, caps: ws.caps });
 const sendJSON = (ws, obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
 
-function join(ws, roomId) {
+// ---------- 코드 무작위 대입 막기: 같은 곳에서 10분 안에 10번 틀리면 10분 동안 코드 입장 차단 ----------
+const FAIL_WINDOW = 10 * 60e3, FAIL_MAX = 10, BLOCK_FOR = 10 * 60e3;
+const fails = new Map();   // ip -> { times: [], until }
+function codeBlocked(ip) {
+  const f = fails.get(ip);
+  return f && f.until > Date.now() ? Math.ceil((f.until - Date.now()) / 60000) : 0;
+}
+function codeFailed(ip) {
+  const now = Date.now();
+  const f = fails.get(ip) || { times: [], until: 0 };
+  f.times = f.times.filter(t => now - t < FAIL_WINDOW);
+  f.times.push(now);
+  let left = FAIL_MAX - f.times.length;
+  if (left <= 0) { f.until = now + BLOCK_FOR; f.times = []; left = 0; }
+  fails.set(ip, f);
+  return left;
+}
+setInterval(() => { const now = Date.now(); for (const [ip, f] of fails) if (f.until < now && !f.times.some(t => now - t < FAIL_WINDOW)) fails.delete(ip); }, 60e3);
+
+// ---------- 입장: 방에 이미 기기가 있으면 기존 기기의 허용을 받아야 들어옴 ----------
+function requestJoin(ws, roomId) {
+  if (ws.room === roomId) return;
+  const room = rooms.get(roomId);
+  if (!room || room.peers.size === 0) return admit(ws, roomId);   // 빈 방(새 연결·혼자 재접속)은 바로
+  leave(ws);
+  cancelPending(ws);
+  const reqId = randomId(10);
+  const timer = setTimeout(() => answer(roomId, reqId, false, 'timeout'), APPROVAL_WAIT);
+  room.pending.set(reqId, { ws, timer });
+  ws.pending = { roomId, reqId };
+  for (const other of room.peers.values()) sendJSON(other, { type: 'join-request', reqId, peer: info(ws) });
+  sendJSON(ws, { type: 'waiting', room: roomId });
+}
+function answer(roomId, reqId, allow, reason) {
+  const room = rooms.get(roomId);
+  const req = room && room.pending.get(reqId);
+  if (!req) return;
+  clearTimeout(req.timer);
+  room.pending.delete(reqId);
+  req.ws.pending = null;
+  for (const other of room.peers.values()) sendJSON(other, { type: 'join-done', reqId, allowed: !!allow });
+  if (allow) admit(req.ws, roomId);
+  else sendJSON(req.ws, { type: 'join-denied', reason: reason || 'denied' });
+}
+function cancelPending(ws) {
+  if (!ws.pending) return;
+  const { roomId, reqId } = ws.pending;
+  ws.pending = null;
+  const room = rooms.get(roomId);
+  const req = room && room.pending.get(reqId);
+  if (!req) return;
+  clearTimeout(req.timer);
+  room.pending.delete(reqId);
+  for (const other of room.peers.values()) sendJSON(other, { type: 'join-done', reqId, allowed: false });
+}
+function admit(ws, roomId) {
   if (ws.room === roomId) return;
   leave(ws);
+  cancelPending(ws);
   let room = rooms.get(roomId);
   if (!room) {
-    room = { peers: new Map(), code: newCode() };
+    room = { peers: new Map(), code: newCode(), pending: new Map() };
     rooms.set(roomId, room);
     codes.set(room.code, roomId);
   }
@@ -165,7 +222,11 @@ function leave(ws) {
   if (!room) { ws.room = null; return; }
   room.peers.delete(ws.id);
   for (const other of room.peers.values()) sendJSON(other, { type: 'peer-left', id: ws.id });
-  if (room.peers.size === 0) { codes.delete(room.code); rooms.delete(ws.room); }
+  if (room.peers.size === 0) {
+    // 허용해 줄 기기가 모두 나가면 기다리던 요청은 거절
+    for (const [reqId] of room.pending) answer(ws.room, reqId, false, 'empty');
+    codes.delete(room.code); rooms.delete(ws.room);
+  }
   ws.room = null;
 }
 
@@ -176,11 +237,13 @@ function peerOf(ws, id) {
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 2 * 1024 * 1024 });
 
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
   ws.id = randomId(8);
+  ws.ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '';
   ws.name = '기기';
   ws.kind = 'pc';
   ws.room = null;
+  ws.pending = null;
   ws.pub = null;
   ws.dev = ws.id;
   ws.caps = { fs: false, pid: ws.id };
@@ -213,19 +276,31 @@ wss.on('connection', ws => {
         };
         break;
       case 'create':
-        join(ws, randomId(10));
+        admit(ws, randomId(10));
         break;
       case 'join': {
         if (m.code) {
+          const wait = codeBlocked(ws.ip);
+          if (wait) return sendJSON(ws, { type: 'error', code: 'blocked', message: `코드를 여러 번 틀려서 ${wait}분 동안 코드 입장이 막혔어요. 잠시 뒤 다시 시도하세요.` });
           const roomId = codes.get(String(m.code));
-          if (!roomId) return sendJSON(ws, { type: 'error', code: 'nocode', message: '그 코드로 열린 연결이 없어요. 숫자를 다시 확인하세요.' });
-          join(ws, roomId);
+          if (!roomId) {
+            const left = codeFailed(ws.ip);
+            if (!left) return sendJSON(ws, { type: 'error', code: 'blocked', message: `코드를 여러 번 틀려서 ${BLOCK_FOR / 60000}분 동안 코드 입장이 막혔어요. 잠시 뒤 다시 시도하세요.` });
+            return sendJSON(ws, { type: 'error', code: 'nocode', message: left <= 3
+              ? `그 코드로 열린 연결이 없어요. ${left}번 더 틀리면 잠시 막혀요.`
+              : '그 코드로 열린 연결이 없어요. 숫자를 다시 확인하세요.' });
+          }
+          requestJoin(ws, roomId);
         } else if (ROOM_RE.test(m.room || '')) {
-          join(ws, m.room);
+          requestJoin(ws, m.room);
         }
         break;
       }
+      case 'join-answer':   // 기존 기기가 새 기기를 허용/거절
+        if (ws.room) answer(ws.room, String(m.reqId || ''), !!m.allow, 'denied');
+        break;
       case 'leave':
+        cancelPending(ws);
         leave(ws);
         break;
       case 'rename': {
@@ -243,7 +318,7 @@ wss.on('connection', ws => {
     }
   });
 
-  ws.on('close', () => leave(ws));
+  ws.on('close', () => { cancelPending(ws); leave(ws); });
 });
 
 // 끊긴 연결 정리
