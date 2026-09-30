@@ -9,6 +9,8 @@
 const SYNC_WINDOW = 24 * 1024 * 1024;   // 받는 쪽 확인이 안 된 전송량 한도 (메모리 폭주 방지)
 const SYNC_INDEX_PART = 1500;           // 목록을 나눠 보내는 단위
 const SYNC_RESCAN_RECV = 8000;          // 받는 쪽 폴더 재확인 주기
+const SYNC_STALL = 30000;               // 받는 쪽 응답이 이만큼 없으면 멈춘 것으로 보고 다시 시도
+const SYNC_RETRY = 3;                   // 자동 재시도 횟수
 const SYNC_EXTRA_IGNORE = '*.crswap';   // 크롬이 쓰는 중에 만드는 임시 파일
 
 const Sync = {
@@ -189,8 +191,18 @@ async function push(sess) {
   sess.state = 'syncing';
   sess.prog = { done: 0, total: list.length, bytes: 0, totalBytes: sess.diff.bytes, errors: 0, start: performance.now(), files: [], diffs: {}, status: new Map(sess.diff.status) };
   sess.inflight = 0; sess.pending.clear();
+  sess.lastAck = Date.now();
   syncRender();
   const aliveNow = () => S.peers.get(sess.peerId) === p;
+  // 확인 응답을 기다림. 응답이 SYNC_STALL 동안 없으면 멈춘 것으로 보고 중단 (영원히 기다리지 않음)
+  const waitAcks = async done => {
+    const started = Date.now();
+    while (!done() && aliveNow()) {
+      await Promise.race([new Promise(r => sess.wake.push(r)), sleep(1000)]);
+      if (Date.now() - Math.max(sess.lastAck, started) > SYNC_STALL) throw new Error('stalled');
+    }
+  };
+  let stalled = false;
   try {
     await p.keyP;
     if (dels.length) await sendCtrl(p, { t: 'sync-del', sid, paths: dels });
@@ -201,7 +213,7 @@ async function push(sess) {
       try { file = await ent.handle.getFile(); } catch { sess.prog.total--; continue; }
       let hash = ent.hash;
       if (file.size !== ent.size || file.lastModified !== ent.mtime) hash = await hashFile(file);   // 훑은 뒤 또 바뀐 파일
-      while (sess.inflight > SYNC_WINDOW && aliveNow()) await new Promise(r => sess.wake.push(r));
+      await waitAcks(() => sess.inflight <= SYNC_WINDOW);
       if (!aliveNow()) throw new Error('peer gone');
       const how = via(p);
       const chunk = how === 'dc' ? CHUNK_DC : CHUNK_WS;
@@ -223,14 +235,15 @@ async function push(sess) {
       }
     }
     // 마지막 파일들의 확인을 기다림
-    const until = Date.now() + 120000;
-    while (sess.pending.size && aliveNow() && Date.now() < until) await Promise.race([new Promise(r => sess.wake.push(r)), sleep(1000)]);
-    if (sess.pending.size) throw new Error('ack timeout');
+    await waitAcks(() => !sess.pending.size);
+    if (!aliveNow()) throw new Error('peer gone');
     const n = sess.prog.done;
+    sess.retries = 0;
     toast(sess.prog.errors ? `${n}개 보냄 · ${sess.prog.errors}개 실패` : `${sess.name}에 변경 ${n}개를 보냈어요`);
   } catch (err) {
     console.warn('push', err);
-    toast('동기화가 중간에 끊겼어요. 다시 연결되면 남은 것만 이어서 맞춰요.');
+    stalled = aliveNow();
+    if (!stalled) toast('동기화가 중간에 끊겼어요. 다시 연결되면 남은 것만 이어서 맞춰요.');
   }
   const pg = sess.prog;
   if (pg && pg.files.length) {
@@ -240,6 +253,17 @@ async function push(sess) {
   sess.prog = null;
   diff(sess);
   syncRender();
+  // 연결은 살아 있는데 응답이 멈췄으면 남은 것만 자동으로 다시 보냄
+  if (stalled && sess.state === 'ready' && hasWork(sess)) {
+    sess.retries = (sess.retries || 0) + 1;
+    if (sess.retries <= SYNC_RETRY) {
+      toast(`상대 PC의 응답이 없어서 남은 ${sess.diff.send.length}개를 다시 보내요 (${sess.retries}/${SYNC_RETRY})`);
+      setTimeout(() => push(sess), 2000);
+    } else {
+      sess.retries = 0;
+      toast('상대 PC가 응답하지 않아 멈췄어요. 상대 화면이 열려 있는지 확인하고 공유하기를 다시 눌러 주세요.', 5000);
+    }
+  }
 }
 function wakeAll(sess) { for (const r of sess.wake.splice(0)) r(); }
 
@@ -289,6 +313,7 @@ async function inReady(s) {
 }
 async function inIndex(s) {
   if (s.state !== 'ready' || s.receiving || s.indexing) return;
+  if (Date.now() - (s.lastWrite || 0) < 10000) return;   // 받는 중이면 폴더 재검사는 잠시 쉼
   const p = S.peers.get(s.peerId);
   if (!p) return;
   s.indexing = true;
@@ -315,6 +340,14 @@ async function inFile(p, m) {
   const fail = msg => sendCtrl(p, { t: 'sync-err', sid: m.sid, path: m.path, msg }).catch(() => {});
   if (!s || !['ready', 'receiving'].includes(s.state)) return fail('not ready');
   if (!path || isIgnored(s.rules, path, false)) return fail('bad path');
+  s.lastWrite = Date.now();
+  for (const [key, old] of Sync.fidMap) {   // 멈췄다가 다시 보내는 경우: 같은 파일의 쓰다 만 것을 정리
+    if (old.s === s && old.path === path) {
+      Sync.fidMap.delete(key);
+      old.w.abort().catch(() => {});
+      s.receiving = Math.max(0, s.receiving - 1);
+    }
+  }
   try {
     let existed = false, oldText = null;
     try {
@@ -346,6 +379,7 @@ Sync.onChunk = async (p, fid, data) => {
     return;
   }
   st.done += data.length;
+  st.s.lastWrite = Date.now();
   if (st.done >= st.size) { Sync.fidMap.delete(key); await inFinish(p, st); }
 };
 async function inFinish(p, st) {
@@ -459,6 +493,7 @@ Sync.onCtrl = async (p, m) => {
       }
       const w = sess.pending.get(m.path);
       if (w != null) { sess.pending.delete(m.path); sess.inflight -= w; }
+      sess.lastAck = Date.now();
       if (sess.prog) { if (m.t === 'sync-ack') sess.prog.done++; else sess.prog.errors++; }
       wakeAll(sess);
       syncRender();

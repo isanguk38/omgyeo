@@ -377,9 +377,11 @@ function drain(p, how) {
 function sendCtrl(p, obj, how) {
   const task = p.sendChain.then(async () => {
     await p.keyP;
-    const h = how || via(p);
+    let h = how || via(p);
     const frame = await frameCtrl(p, obj);
     await drain(p, h);
+    // 통로를 지정하지 않은 메시지(확인 응답 등)는 직접 연결이 막 닫혔으면 서버 경유로 보내서 유실되지 않게
+    if (!canSend(p, h) && !how && h === 'dc') h = 'relay';
     if (!canSend(p, h)) throw new Error('closed');
     rawSend(p, h, frame);
   });
