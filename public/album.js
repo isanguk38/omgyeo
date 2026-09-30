@@ -266,16 +266,12 @@ Album.onCtrl = async (p, m) => {
       const how = via(p);
       const chunk = how === 'dc' ? CHUNK_DC : CHUNK_WS;
       const fid = S.fidSeq++;
+      const st = chunkStream(p, how, fid);
       try {
         await sendCtrl(p, { t: 'alb-file', rid: m.rid, fid, size: it.orig.size, mime: it.mime }, how);
         for (let off = 0; off < it.orig.size; off += READ_BLOCK) {
           const block = new Uint8Array(await it.orig.slice(off, off + READ_BLOCK).arrayBuffer());
-          for (let i = 0; i < block.length; i += chunk) {
-            const frame = await frameChunk(p, fid, block.subarray(i, i + chunk));
-            await drain(p, how);
-            if (!canSend(p, how)) return;
-            rawSend(p, how, frame);
-          }
+          for (let i = 0; i < block.length; i += chunk) await sendChunk(st, block.subarray(i, i + chunk));
         }
       } catch {}
       return;

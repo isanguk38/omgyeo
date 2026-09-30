@@ -281,6 +281,7 @@ wss.on('connection', (ws, req) => {
         ws.caps = {
           fs: !!(m.caps && m.caps.fs),
           pid: m.caps && typeof m.caps.pid === 'string' && /^[a-z0-9]{8,32}$/.test(m.caps.pid) ? m.caps.pid : ws.dev,
+          lanes: !!(m.caps && m.caps.lanes),
         };
         break;
       case 'create':

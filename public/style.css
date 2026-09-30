@@ -170,6 +170,8 @@ dialog input{border:1px solid var(--line);background:var(--sunk);border-radius:1
 /* 상단 오른쪽 */
 .top-right{display:flex;align-items:center;gap:8px;min-width:0;max-width:70%}
 .top-right .me{max-width:none;min-width:0}
+.awake{display:inline-flex;align-items:center;gap:4px;height:28px;padding:0 10px;border-radius:999px;background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent);font-size:12px;font-weight:600;white-space:nowrap;flex:none}
+@media (max-width:420px){.awake span{display:none}.awake{padding:0 8px}}
 .bell{width:34px;height:34px;flex:none;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--muted);display:grid;place-items:center}
 .bell[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 
@@ -349,7 +351,7 @@ dialog.wide[open]{display:flex}
 .sync-note{margin:0;font-size:13px;color:var(--muted);background:var(--surface);border:1px dashed var(--line);border-radius:14px;padding:14px}
 
 /* ===== 연결 후 화면: 한 화면에 고정된 앱 레이아웃 ===== */
-body.in-room{height:100dvh;overflow:hidden;display:flex;flex-direction:column}
+body.in-room{height:100dvh;height:var(--app-h,100dvh);overflow:hidden;display:flex;flex-direction:column}
 body.in-room > .top,body.in-room > .secure-note,body.in-room > .wake{flex:none;width:100%}
 .in-room .room{flex:1;min-height:0;width:100%;max-width:1280px;margin:0 auto;padding-block:0 16px;display:grid;grid-template-columns:320px minmax(0,1fr);gap:20px;align-items:stretch}
 .in-room .side{position:static;min-height:0;overflow-y:auto;padding-right:4px;scrollbar-width:thin}

@@ -303,7 +303,7 @@ async function push(sess) {
   const waitAcks = async done => {
     const started = Date.now();
     while (!done() && aliveNow()) {
-      await Promise.race([new Promise(r => sess.wake.push(r)), sleep(1000)]);
+      await Promise.race([new Promise(r => sess.wake.push(r)), bgSleep(1000)]);
       if (Date.now() - Math.max(sess.lastAck, started) > SYNC_STALL) throw new Error('stalled');
     }
   };
@@ -314,6 +314,7 @@ async function push(sess) {
     let stream = source.pipeThrough(counter);
     if (zip) stream = stream.pipeThrough(new CompressionStream('gzip'));
     const reader = stream.getReader();
+    const st = chunkStream(p, how, fid);
     let last = 0;
     try {
       for (;;) {
@@ -323,15 +324,13 @@ async function push(sess) {
         for (let i = 0; i < u8.length; i += chunk) {
           if (sess.cancelled) throw new Error('cancelled');
           const piece = u8.subarray(i, i + chunk);
-          const frame = await frameChunk(p, fid, piece);
-          await drain(p, how);
-          if (!canSend(p, how)) throw new Error('closed');
-          rawSend(p, how, frame);
+          await sendChunk(st, piece);
           sess.prog.wire += piece.length;
         }
         if (performance.now() - last > 250) { last = performance.now(); syncRender(); }
       }
     } catch (err) { reader.cancel().catch(() => {}); throw err; }
+    return st.off;
   };
   const track = (path, size) => { const w = Math.max(size, 1); sess.inflight += w; sess.pending.set(path, w); };
   const fresh = async path => {   // 훑은 뒤 또 바뀐 파일은 해시를 다시 계산
@@ -357,8 +356,8 @@ async function push(sess) {
         const zip = ZIP_OK && compressible(u.single) && f.file.size >= 4096;
         await sendCtrl(p, { t: 'sync-file', sid, fid, path: u.single, size: f.file.size, hash: f.hash, z: zip ? 'gzip' : undefined }, how);
         track(u.single, f.file.size);
-        await streamOut(how, fid, f.file.stream(), zip);
-        if (zip) await sendCtrl(p, { t: 'sync-end', sid, fid }, how);
+        const n = await streamOut(how, fid, f.file.stream(), zip);
+        if (zip) await sendCtrl(p, { t: 'sync-end', sid, fid, n }, how);
       } else {
         const files = [], blobs = [];
         for (const path of u.files) {
@@ -371,8 +370,8 @@ async function push(sess) {
         const zip = ZIP_OK && bytes >= 2048 && files.some(f => compressible(f.path));
         await sendCtrl(p, { t: 'sync-batch', sid, fid, files, z: zip ? 'gzip' : undefined }, how);
         for (const f of files) track(f.path, f.size);
-        if (bytes) await streamOut(how, fid, new Blob(blobs).stream(), zip);
-        if (zip || !bytes) await sendCtrl(p, { t: 'sync-end', sid, fid }, how);
+        const n = bytes ? await streamOut(how, fid, new Blob(blobs).stream(), zip) : 0;
+        if (zip || !bytes) await sendCtrl(p, { t: 'sync-end', sid, fid, n }, how);
       }
     }
     // 마지막 파일들의 확인을 기다림
@@ -411,7 +410,7 @@ async function push(sess) {
     sess.retries = (sess.retries || 0) + 1;
     if (sess.retries <= SYNC_RETRY) {
       toast(`상대 PC의 응답이 없어서 남은 ${sess.diff.send.length}개를 다시 보내요 (${sess.retries}/${SYNC_RETRY})`);
-      setTimeout(() => push(sess), 2000);
+      bgTimer(() => push(sess), 2000);
     } else {
       sess.retries = 0;
       markResume(sess, false);
@@ -454,7 +453,7 @@ async function inOffer(p, m) {
   Object.assign(s, { peerId: p.id, peerName: p.name, name: cleanName(m.name), rules });
   if (s.handle && await fsPermission(s.handle, 'readwrite', false)) return inReady(s);
   s.state = s.handle ? 'perm' : 'ask';
-  sendCtrl(p, { t: 'sync-waiting', sid }).catch(() => {});
+  sendCtrl(p, { t: 'sync-waiting', sid, why: s.state }).catch(() => {});
   toast(`${p.name}에서 '${s.name}' 폴더를 공유하려고 해요`);
   announce(`${p.name}에서 폴더 공유 요청`, `'${s.name}' 폴더를 받을 위치를 골라 주세요`);
   syncRender();
@@ -554,7 +553,8 @@ async function openRecv(s, rawPath, size, hash) {
 // 파일을 닫고 캐시·히스토리에 반영. 확인 응답에 넣을 내용을 돌려줌
 async function closeRecv(st) {
   const s = st.s;
-  await st.w.close();
+  s.opAt = Date.now();   // 큰 파일은 닫는 데(임시 파일 옮기기·검사) 오래 걸릴 수 있음
+  try { await st.w.close(); } finally { s.opAt = 0; s.work = (s.work || 0) + 1; }
   const file = await st.fh.getFile();
   if (!s.cache) s.cache = (await idb.get('hash', `recv:${s.sid}`)) || {};
   s.cache[st.path] = [file.size, file.lastModified, st.hash];   // 받은 파일은 다시 해시하지 않도록
@@ -576,7 +576,20 @@ function sendAcks(p, sid, items, errs) {
   for (const it of items) { const n = it.diff ? it.diff.length : 0; if (n > budget) it.diff = null; else budget -= n; }
   sendCtrl(p, { t: 'sync-acks', sid, items, errs }).catch(() => {});
 }
-function unitStart(s) { s.receiving++; s.state = 'receiving'; }
+// 받는 동안 "살아 있음" 신호: 큰 파일을 마무리 저장하거나 밀린 조각을 처리하느라 완료 응답이 늦어도
+// 보내는 쪽이 멈춘 것으로 오해해 처음부터 다시 보내지 않게 함 (일한 양 work가 늘었는지 함께 보냄)
+function aliveLoop(s) {
+  if (!s.receiving || s.aliveOn) return;
+  s.aliveOn = true;
+  const tick = () => {
+    const p = S.peers.get(s.peerId);
+    if (!s.receiving || !p) { s.aliveOn = false; return; }
+    sendCtrl(p, { t: 'sync-alive', sid: s.sid, work: s.work || 0, busy: s.opAt ? Math.round((Date.now() - s.opAt) / 1000) : 0 }).catch(() => {});
+    bgTimer(tick, 4000);
+  };
+  bgTimer(tick, 4000);
+}
+function unitStart(s) { s.receiving++; s.state = 'receiving'; aliveLoop(s); }
 function unitDone(s) {
   s.receiving = Math.max(0, s.receiving - 1);
   if (s.receiving) return;
@@ -694,8 +707,10 @@ Sync.onChunk = async (p, fid, data) => {
   const u = Sync.fidMap.get(key);
   if (!u) return;
   u.got += data.length;
+  u.s.work = (u.s.work || 0) + 1;
   if (u.z) {
     try { await u.zw.write(data); } catch {}
+    if (u.endAt != null && u.got >= u.endAt) await completeUnit(key, u);   // 끝 신호가 마지막 조각보다 먼저 왔던 경우
     return;   // 압축은 끝 신호(sync-end)에서 마무리
   }
   await u.sink(data);
@@ -704,7 +719,10 @@ Sync.onChunk = async (p, fid, data) => {
 async function inEnd(p, m) {
   const key = `${p.id}:${m.fid}`;
   const u = Sync.fidMap.get(key);
-  if (u) await completeUnit(key, u);
+  if (!u) return;
+  // 여러 통로로 보내면 끝 신호가 마지막 조각보다 먼저 도착할 수 있음: 보낸 양(n)을 다 받을 때까지 기다림
+  if (Number(m.n) > u.got) { u.endAt = Number(m.n); return; }
+  await completeUnit(key, u);
 }
 async function flushCache(s) {
   if (!s.cache) return;
@@ -765,7 +783,7 @@ Sync.onCtrl = async (p, m) => {
     case 'sync-peek': return inPeek(p, m);
     case 'sync-peekr': { const w = Sync.peeks.get(m.rid); if (w) { Sync.peeks.delete(m.rid); w(m); } return; }
     // 공유하는 쪽
-    case 'sync-waiting': if (mine) { sess.state = 'waiting'; syncRender(); } return;
+    case 'sync-waiting': if (mine) { sess.state = 'waiting'; sess.waitWhy = m.why === 'perm' ? 'perm' : 'ask'; syncRender(); } return;
     case 'sync-scan':   // 상대 PC가 자기 폴더를 훑는 중 (진행률)
       if (mine) { sess.remoteScan = { d: Number(m.done) || 0, n: Number(m.total) || 0 }; sess.busy = false; syncRender(); }
       return;
@@ -789,6 +807,10 @@ Sync.onCtrl = async (p, m) => {
         } else autoPush(sess);
         syncRender();
       }
+      return;
+    case 'sync-alive':   // 받는 쪽이 일하고 있음: 일한 양이 늘었거나 파일 하나를 3분 안쪽으로 마무리하는 중이면 기다림
+      if (!mine) return;
+      if (m.work !== sess.aliveWork || (m.busy > 0 && m.busy < 180)) { sess.aliveWork = m.work; sess.lastAck = Date.now(); }
       return;
     case 'sync-acks': {   // 여러 파일의 확인을 한 번에 (묶음 전송)
       if (!mine) return;
@@ -831,6 +853,9 @@ Sync.onPeerJoined = p => {
   if (isTarget(p)) offer(p);
   syncRender();
 };
+// 화면 꺼짐 방지용: 보내는 중·받는 중·확인 중이면 true (평소 자동으로 폴더를 훑는 것은 제외)
+Sync.isBusy = () => [...Sync.sessions.values()].some(s => s.state === 'syncing' || s.checking)
+  || [...Sync.inbound.values()].some(s => s.state === 'receiving');
 Sync.onPeerLeft = p => {
   for (const sess of Sync.sessions.values()) {
     if (sess.peerId !== p.id) continue;
@@ -867,7 +892,7 @@ function drawSync() {
   for (const s of Sync.inbound.values()) {
     const st = {
       ask: `<b>${esc(s.peerName)}</b>이(가) <b>'${esc(s.name)}'</b> 폴더를 보내려고 해요. 고른 위치 안에 '${esc(s.name)}' 폴더를 만들어 받아요.`,
-      perm: `<b>'${esc(s.name)}'</b> 폴더에 받으려면 접근 허용이 필요해요.`,
+      perm: `전에 고른 받을 폴더 <b>'${esc(s.name)}'</b>는 그대로 기억하고 있어요. 브라우저 보안 때문에 새로고침하거나 브라우저를 다시 열면 [폴더 접근 허용]을 한 번 더 눌러야 해요. 크롬 창에서 <b>'방문할 때마다 허용'</b>을 고르면 다음부터는 묻지 않아요.`,
       ready: s.scanProg ? `<span class="busy">받는 폴더 확인 중 ${s.scanProg.d.toLocaleString()} / ${s.scanProg.n.toLocaleString()}개</span>`
         : `<span class="ok">✓ 연결됨</span> · ${esc(s.peerName)}에서 받는 중${s.fileCount != null ? ` · 폴더 파일 ${s.fileCount.toLocaleString()}개` : ''} · 받은 파일 ${s.count}개${s.last ? ` · 마지막 적용 ${ago(s.last)}` : ''}`,
       receiving: `<span class="busy">변경 적용 중…</span> · 받은 파일 ${s.count}개`,
@@ -937,6 +962,28 @@ function syncBadge() {
   el.textContent = ask ? '!' : String(n);
   el.classList.toggle('alert', !!ask);
   el.title = ask ? '폴더 공유 요청이 있어요' : `보낼 변경이 있는 기기 ${n}대`;
+  syncAskCards();
+}
+// 받을 위치 고르기·접근 허용이 필요하면 어느 탭을 보고 있든 화면 위에 카드로 알림 (누르면 바로 처리)
+function syncAskCards() {
+  const want = new Map();
+  for (const s of Sync.inbound.values()) if (s.state === 'ask' || s.state === 'perm') want.set(s.sid, s);
+  for (const el of document.querySelectorAll('.join-req[data-sync]')) if (!want.has(el.dataset.sync) || want.get(el.dataset.sync).state !== el.dataset.st) el.remove();
+  for (const [sid, s] of want) {
+    if (s.cardHidden === s.state || document.querySelector(`.join-req[data-sync="${sid}"]`)) continue;
+    const box = document.createElement('div');
+    box.className = 'join-req';
+    box.dataset.sync = sid; box.dataset.st = s.state;
+    const perm = s.state === 'perm';
+    box.innerHTML = `<span class="jr-ic">${ICONS.pc}</span>
+      <div class="jr-text"><b></b><span>${perm ? '전에 고른 받을 폴더는 그대로예요. 새로고침하면 브라우저가 접근 허용을 한 번 더 물어봐요.' : '받을 폴더를 고르면 바로 받기 시작해요.'}</span></div>
+      <div class="jr-btns"><button type="button" class="solid">${perm ? '폴더 접근 허용' : '받을 위치 고르기'}</button><button type="button">나중에</button></div>`;
+    box.querySelector('b').textContent = `${s.peerName}의 '${s.name}' 폴더 동기화${perm ? '를 이어서 받으려면 허용이 필요해요' : ' 요청'}`;
+    const [ok, later] = box.querySelectorAll('button');
+    ok.onclick = () => { box.remove(); perm ? inAllow(sid) : inPick(sid); };
+    later.onclick = () => { s.cardHidden = s.state; box.remove(); };   // 동기화 탭에서는 계속 고를 수 있음
+    $('#joinReqs').appendChild(box);
+  }
 }
 // 확인 단계 문구: 내 폴더 훑기 → 상대 폴더 훑기 → (상대가 받는 중이면) 대기
 function checkPhase(sess) {
@@ -954,7 +1001,9 @@ function peerRow(sess) {
   else if ((sess.checking || sess.state === 'offer' || (sess.state === 'ready' && !sess.remote)) && phase) st = `<span class="busy"><span class="spin"></span>${phase}</span>`;
   else if (sess.checking) st = '<span class="busy"><span class="spin"></span>동기화 확인 중…</span>';
   else if (sess.state === 'offer') st = '<span class="busy"><span class="spin"></span>요청 보냄 · 상대 PC가 확인하는 중</span>';
-  else if (sess.state === 'waiting') st = '상대가 받을 위치를 고르는 중';
+  else if (sess.state === 'waiting') st = sess.waitWhy === 'perm'
+    ? `${esc(sess.name)} 화면에서 [폴더 접근 허용]을 눌러야 이어져요 (새로고침하면 브라우저가 한 번 더 물어봐요)`
+    : `${esc(sess.name)} 화면에서 받을 위치를 골라야 시작돼요`;
   else if (sess.state === 'away') st = '연결 끊김 · 다시 연결되면 이어서 맞춰요';
   else if (sess.state === 'syncing' && sess.prog) {
     const pg = sess.prog;

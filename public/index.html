@@ -12,6 +12,9 @@
 <header class="top">
   <div class="logo"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M13 6l6 6-6 6"/></svg></span>옮겨</div>
   <div class="top-right">
+    <span class="awake" id="awake" title="보내거나 받는 동안 화면과 PC가 잠들지 않게 하고 있어요. 끝나면 자동으로 풀려요." hidden>
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><span>화면 켜 둠</span>
+    </span>
     <button type="button" class="bell help-btn" id="helpBtn" title="사용 설명서" aria-label="사용 설명서">?</button>
     <button type="button" class="bell" id="bellBtn" aria-pressed="false" title="받으면 알림 받기">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>
@@ -242,7 +245,8 @@
         </ol>
         <h4>다시 연결하기</h4>
         <p>사이트를 다시 열면 지난번 연결로 자동으로 들어가요. 예전 연결은 첫 화면의 <b>이전에 연결한 기기</b>에서 <b>다시 연결</b>을 누르면 돼요. 연결마다 대화 기록, 모임 앨범, 폴더 동기화 설정이 따로 저장돼요.</p>
-        <p class="help-tip">연결된 기기 옆에 "직접 연결 / 중계 연결 / 서버 경유"가 표시돼요. 직접 연결이 가장 빠르고, 서버 경유는 느릴 수 있어요.</p>
+        <p class="help-tip">연결된 기기 옆에 "직접 연결 / 중계 연결 / 서버 경유"가 표시돼요. 직접 연결이 가장 빠르고, 서버 경유는 느릴 수 있어요. 직접 연결이면 "통로 4개"처럼 여러 통로로 나눠 보내서 더 빨라요.</p>
+        <p class="help-tip">보내거나 받는 동안에는 화면과 PC가 잠들지 않아요(위쪽 "화면 켜 둠"). 끝나면 자동으로 풀려요. 다른 탭을 봐도 전송은 계속돼요.</p>
       </section>
 
       <section id="help-send" hidden>

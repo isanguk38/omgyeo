@@ -6,6 +6,8 @@
  * 이어받기: 파일마다 고유 uid를 두고, 받는 쪽이 "어디까지 받았는지" 답하면 보내는 쪽이 그 지점부터 보냅니다.
  * 프레임: [종류 1바이트] 0=제어(평문) 1=조각(평문) 2=제어(암호) 3=조각(암호)
  *         조각 = [종류][fid 4바이트][(암호일 때) iv 12바이트][내용]
+ *         4=조각(평문·순번) 5=조각(암호·순번) = [종류][fid 4][순번 오프셋 8][(암호) iv 12][내용]
+ * 여러 통로: 직접 연결이 되면 연결을 LANES개 더 열어 조각을 나눠 보냄. 조각마다 순번이 있어 받는 쪽이 순서대로 맞춤
  */
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -16,6 +18,8 @@ const HIGH_WATER = 4 * 1024 * 1024;  // 이만큼 쌓이면 잠시 멈춤
 const LOW_WATER = 512 * 1024;
 const MERGE_AT = 32 * 1024 * 1024;   // 받은 조각을 이만큼마다 Blob으로 묶어 메모리 절약
 const P2P_WAIT = 6000;               // 직접 연결을 기다리는 시간
+const LANES = 3;                     // 직접 연결일 때 더 여는 통로 수 (기본 통로 포함 4개로 나눠 보냄)
+const LANES_OK = typeof RTCPeerConnection !== 'undefined';
 const MAX_RETRY = 8;                 // 같은 기기에 연결된 상태에서 재시도 횟수
 const ZIP_LIMIT = 0xFFFFFFFF;        // zip(비압축, zip64 미지원) 한계
 const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
@@ -49,6 +53,18 @@ function concat(...arrs) {
   return out;
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 가려진 탭에서도 늦어지지 않는 타이머. 브라우저는 다른 탭을 보는 동안 이 페이지의 setTimeout을 1초,
+// 오래 가려 두면 1분 간격까지 늦추지만 워커 안의 타이머는 그대로 돌아서 전송 흐름이 멈추지 않음
+const bgTimer = (() => {
+  try {
+    const w = new Worker(URL.createObjectURL(new Blob(['onmessage=e=>setTimeout(()=>postMessage(e.data[0]),e.data[1])'], { type: 'text/javascript' })));
+    const cbs = new Map();
+    let n = 0;
+    w.onmessage = e => { const f = cbs.get(e.data); cbs.delete(e.data); if (f) f(); };
+    return (fn, ms) => { const id = ++n; cbs.set(id, fn); w.postMessage([id, ms]); };
+  } catch { return (fn, ms) => setTimeout(fn, ms); }
+})();
+const bgSleep = ms => new Promise(r => bgTimer(r, ms));
 // 다음 화면 갱신 때 실행. 창이 가려지거나 최소화되면 requestAnimationFrame이 멈추므로 타이머로도 보장
 function nextFrame(cb) {
   let done = false;
@@ -129,6 +145,7 @@ const S = {
   peers: new Map(),          // 서버 연결 id -> peer
   feed: [],                  // 화면 목록 (최신이 앞)
   partials: new Map(),       // uid -> 받는 중/받은 파일
+  reorder: new Map(),        // 여러 통로로 온 조각을 순서대로 맞추는 곳
   fidMap: new Map(),         // `${peerId}:${fid}` -> 받는 파일
   bundlesIn: new Map(),      // `${dev}:${bid}` -> 받는 폴더
   parked: [],                // 상대가 끊겨서 멈춘 보내기 (같은 기기가 돌아오면 이어서)
@@ -180,6 +197,18 @@ async function frameChunk(p, fid, data) {
   return concat(head, iv, ct);
 }
 
+// 순번이 붙은 조각 (여러 통로로 보낼 때 받는 쪽이 순서를 맞추는 데 씀)
+async function frameChunkAt(p, fid, off, data) {
+  const head = new Uint8Array(13);
+  head[0] = p.key ? 5 : 4;
+  const dv = new DataView(head.buffer);
+  dv.setUint32(1, fid); dv.setUint32(5, Math.floor(off / 2 ** 32)); dv.setUint32(9, off >>> 0);
+  if (!p.key) return concat(head, data);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: head }, p.key, data));
+  return concat(head, iv, ct);
+}
+
 // ---------- 서버 연결 ----------
 function connect() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
@@ -187,7 +216,7 @@ function connect() {
   S.ws = ws;
   ws.onopen = () => {
     setNet(true);
-    sendServer({ type: 'hello', name: myName, kind: DEV.kind, pub: myPub, dev: SESSION_DEV, caps: { fs: FS_OK, pid: PERSIST_ID } });
+    sendServer({ type: 'hello', name: myName, kind: DEV.kind, pub: myPub, dev: SESSION_DEV, caps: { fs: FS_OK, pid: PERSIST_ID, lanes: LANES_OK } });
     if (S.want === 'create') sendServer({ type: 'create' });
     else if (S.want) sendServer({ type: 'join', ...S.want });
   };
@@ -278,6 +307,7 @@ function addPeer(info, initiator) {
     id: info.id, dev: info.dev || info.id, name: info.name, kind: info.kind, pub: info.pub,
     pc: null, dc: null, mode: 'connecting', queue: [], busy: false, pending: [],
     key: null, safety: null, waiters: new Map(), recvChain: Promise.resolve(), sendChain: Promise.resolve(),
+    initiator, lanes: null, laneGen: 0,
   };
   S.peers.set(p.id, p);
   p.caps = info.caps || {};
@@ -317,9 +347,10 @@ function setupChannel(p) {
   const dc = p.dc;
   dc.binaryType = 'arraybuffer';
   dc.bufferedAmountLowThreshold = LOW_WATER;
-  dc.onopen = () => { p.mode = 'p2p'; clearTimeout(p.timer); renderPeers(); setTimeout(() => detectPath(p), 300); };
+  dc.onopen = () => { p.mode = 'p2p'; clearTimeout(p.timer); renderPeers(); setTimeout(() => detectPath(p), 300); openLanes(p); };
   dc.onclose = () => {
     if (!alive(p)) return;
+    p.laneGen++;
     if (p.mode === 'p2p') { p.mode = 'relay'; renderPeers(); }
     rejectAll(p);   // 진행 중이던 전송은 서버 경유로 이어서 보냄
   };
@@ -328,19 +359,97 @@ function setupChannel(p) {
 async function onSignal(from, d) {
   const p = S.peers.get(from);
   if (!p || !p.pc) return;
+  if (d.lane) {   // 추가 통로의 연결 정보
+    const i = d.lane | 0;
+    if (i < 1 || i > LANES) return;
+    let l = p.lanes && p.lanes[i - 1];
+    if (!l) { if (p.initiator || !LANES_OK) return; l = makeLane(p, i); }
+    return applySignal(l.pc, l.pending, from, d, i);
+  }
+  return applySignal(p.pc, p.pending, from, d);
+}
+async function applySignal(pc, pending, to, d, lane) {
   try {
     if (d.sdp) {
-      await p.pc.setRemoteDescription(d.sdp);
+      await pc.setRemoteDescription(d.sdp);
       if (d.sdp.type === 'offer') {
-        await p.pc.setLocalDescription(await p.pc.createAnswer());
-        sendServer({ type: 'signal', to: from, data: { sdp: p.pc.localDescription } });
+        await pc.setLocalDescription(await pc.createAnswer());
+        sendServer({ type: 'signal', to, data: { lane, sdp: pc.localDescription } });
       }
-      for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(() => {});
+      for (const c of pending.splice(0)) await pc.addIceCandidate(c).catch(() => {});
     } else if (d.candidate) {
-      if (p.pc.remoteDescription) await p.pc.addIceCandidate(d.candidate).catch(() => {});
-      else p.pending.push(d.candidate);
+      if (pc.remoteDescription) await pc.addIceCandidate(d.candidate).catch(() => {});
+      else pending.push(d.candidate);
     }
   } catch (err) { console.warn('signal', err); }
+}
+// ---------- 여러 통로 ----------
+// 한 연결 안에서 통로만 늘리면 같은 혼잡 제어를 나눠 써서 빨라지지 않으므로, 연결 자체를 여러 개 엶
+// (먼저 연결을 건 쪽이 열고, 상대는 받아들이기만 함. 상대가 지원하지 않으면 기본 통로 하나로 보냄)
+function openLanes(p) {
+  if (!p.initiator || !LANES_OK || !(p.caps && p.caps.lanes) || p.lanes || !alive(p)) return;
+  for (let i = 1; i <= LANES; i++) {
+    const l = makeLane(p, i);
+    l.dc = l.pc.createDataChannel('omgyeo-lane', { ordered: true });
+    setupLane(p, l);
+    l.pc.createOffer()
+      .then(o => l.pc.setLocalDescription(o))
+      .then(() => sendServer({ type: 'signal', to: p.id, data: { lane: i, sdp: l.pc.localDescription } }))
+      .catch(err => console.warn('lane offer', err));
+  }
+}
+function makeLane(p, i) {
+  const pc = new RTCPeerConnection({ iceServers: ICECFG.servers });
+  const l = { i, pc, dc: null, pending: [] };
+  pc.onicecandidate = e => { if (e.candidate) sendServer({ type: 'signal', to: p.id, data: { lane: i, candidate: e.candidate } }); };
+  pc.ondatachannel = e => { l.dc = e.channel; setupLane(p, l); };
+  if (!p.lanes) p.lanes = [];
+  p.lanes[i - 1] = l;
+  return l;
+}
+function setupLane(p, l) {
+  const dc = l.dc;
+  dc.binaryType = 'arraybuffer';
+  dc.bufferedAmountLowThreshold = LOW_WATER;
+  dc.onopen = () => renderPeers();
+  dc.onclose = () => {
+    if (!alive(p)) return;
+    // 이 통로로 보낸 조각이 사라졌을 수 있으니 진행 중인 전송은 받은 지점부터 다시
+    p.laneGen++;
+    rejectAll(p);
+    renderPeers();
+  };
+  dc.onmessage = e => onFrame(p, new Uint8Array(e.data));
+}
+const openChans = p => [p.dc, ...(p.lanes || []).map(l => l && l.dc)].filter(dc => dc && dc.readyState === 'open');
+const laneCount = p => (p.mode === 'p2p' ? openChans(p).length : 0);
+// 조각 보내기 흐름: 파일(또는 묶음) 하나를 보낼 때마다 만들고 sendChunk로 차례로 보냄
+function chunkStream(p, how, fid) { return { p, how, fid, off: 0, gen: p.laneGen, multi: how === 'dc' && LANES_OK && !!(p.caps && p.caps.lanes) }; }
+async function sendChunk(st, data) {
+  const { p, how, fid } = st;
+  if (!st.multi) {
+    const frame = await frameChunk(p, fid, data);
+    await drain(p, how);
+    if (!canSend(p, how)) throw new Error('closed');
+    rawSend(p, how, frame);
+    st.off += data.length;
+    return;
+  }
+  const frame = await frameChunkAt(p, fid, st.off, data);
+  st.off += data.length;
+  for (;;) {
+    if (!alive(p) || p.laneGen !== st.gen) throw new Error('closed');
+    const chans = openChans(p);
+    if (!chans.length) throw new Error('closed');
+    let best = chans[0];
+    for (const c of chans) if (c.bufferedAmount < best.bufferedAmount) best = c;
+    if (best.bufferedAmount < HIGH_WATER) { best.send(frame); return; }
+    await new Promise(resolve => {   // 어느 통로든 비면 이어서
+      const done = () => { clearTimeout(t); for (const c of chans) { c.removeEventListener('bufferedamountlow', done); c.removeEventListener('close', done); } resolve(); };
+      const t = setTimeout(done, 1000);
+      for (const c of chans) { c.addEventListener('bufferedamountlow', done); c.addEventListener('close', done); }
+    });
+  }
 }
 // 실제로 어느 길로 연결됐는지 확인: 같은 네트워크 직접 / 인터넷 직접 / TURN 중계
 async function detectPath(p) {
@@ -364,6 +473,8 @@ function closePeer(p) {
   rejectAll(p);
   try { p.dc && p.dc.close(); } catch {}
   try { p.pc && p.pc.close(); } catch {}
+  for (const l of p.lanes || []) { try { l && l.pc.close(); } catch {} }
+  for (const k of S.reorder.keys()) if (k.startsWith(`${p.id}:`)) S.reorder.delete(k);
   for (const job of p.queue) {
     if (['done', 'cancelled', 'failed'].includes(job.state)) continue;
     job.state = 'paused';
@@ -401,7 +512,7 @@ function drain(p, how) {
       p.dc.addEventListener('bufferedamountlow', () => resolve(), { once: true });
       p.dc.addEventListener('close', () => resolve(), { once: true });
     } else {
-      const tick = () => (!S.ws || S.ws.bufferedAmount < HIGH_WATER ? resolve() : setTimeout(tick, 15));
+      const tick = () => (!S.ws || S.ws.bufferedAmount < HIGH_WATER ? resolve() : bgTimer(tick, 15));
       tick();
     }
   });
@@ -428,11 +539,26 @@ function onFrame(p, u8) {
 }
 async function handleFrame(p, u8) {
   const t = u8[0];
-  if (t === 0) return onCtrl(p, JSON.parse(dec.decode(u8.subarray(1))));
-  if (t === 2) {
-    const key = p.key || await p.keyP;
-    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(1, 13) }, key, u8.subarray(13));
-    return onCtrl(p, JSON.parse(dec.decode(pt)));
+  if (t === 0 || t === 2) {
+    let m;
+    if (t === 0) m = JSON.parse(dec.decode(u8.subarray(1)));
+    else {
+      const key = p.key || await p.keyP;
+      m = JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(1, 13) }, key, u8.subarray(13))));
+    }
+    await onCtrl(p, m);
+    if (S.reorder.size) await flushStreams(p);   // 이 안내를 기다리던 조각이 있으면 이어서 처리
+    return;
+  }
+  if (t === 4 || t === 5) {
+    const dv = new DataView(u8.buffer, u8.byteOffset, 13);
+    const fid = dv.getUint32(1), off = dv.getUint32(5) * 2 ** 32 + dv.getUint32(9);
+    let data = u8.subarray(13);
+    if (t === 5) {
+      const key = p.key || await p.keyP;
+      data = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(13, 25), additionalData: u8.subarray(0, 13) }, key, u8.subarray(25)));
+    }
+    return reorderIn(p, fid, off, data);
   }
   const fid = new DataView(u8.buffer, u8.byteOffset + 1, 4).getUint32(0);
   if (t === 1) return onChunk(p, fid, u8.subarray(5));
@@ -442,6 +568,32 @@ async function handleFrame(p, u8) {
     return onChunk(p, fid, new Uint8Array(pt));
   }
 }
+// 여러 통로로 온 조각을 순번대로 맞춤. 받을 준비(파일 안내)가 아직 안 된 조각은 잠시 보관
+function reorderIn(p, fid, off, data) {
+  const key = `${p.id}:${fid}`;
+  let r = S.reorder.get(key);
+  if (!r) { r = { p, fid, next: 0, buf: new Map(), at: 0 }; S.reorder.set(key, r); }
+  r.at = Date.now();
+  if (off >= r.next) r.buf.set(off, data);
+  return flushStream(key, r);
+}
+const chunkOwner = key => S.fidMap.has(key) || (typeof Sync !== 'undefined' && Sync.fidMap.has(key)) || (typeof Album !== 'undefined' && Album.fidMap.has(key));
+async function flushStream(key, r) {
+  if (!chunkOwner(key)) return;
+  while (r.buf.has(r.next)) {
+    const d = r.buf.get(r.next);
+    r.buf.delete(r.next);
+    r.next += d.length;
+    await onChunk(r.p, r.fid, d);
+  }
+}
+async function flushStreams(p) {
+  for (const [key, r] of S.reorder) if (r.p === p && r.buf.size) await flushStream(key, r);
+}
+setInterval(() => {   // 끝난 흐름·주인 없는 조각 정리
+  const now = Date.now();
+  for (const [key, r] of S.reorder) if (now - r.at > (r.buf.size ? 60e3 : 180e3)) S.reorder.delete(key);
+}, 30e3);
 function onCtrl(p, m) {
   if (typeof m.t === 'string' && m.t.startsWith('sync-')) return typeof Sync !== 'undefined' ? Sync.onCtrl(p, m) : undefined;
   if (typeof m.t === 'string' && m.t.startsWith('alb-')) return typeof Album !== 'undefined' ? Album.onCtrl(p, m) : undefined;
@@ -551,15 +703,11 @@ async function sendJob(p, job) {
     job.state = 'sending'; job.done = from; job.start = performance.now(); job.startDone = from;
     scheduleFeed();
     let off = from;
+    const stream = chunkStream(p, how, fid);
     while (off < job.size) {
       if (job.state === 'cancelled') { p.waiters.delete(ackKey); sendCtrl(p, { t: 'cancel', uid: job.uid }).catch(() => {}); return scheduleFeed(); }
       const block = new Uint8Array(await job.file.slice(off, off + READ_BLOCK).arrayBuffer());
-      for (let i = 0; i < block.length; i += chunk) {
-        const frame = await frameChunk(p, fid, block.subarray(i, i + chunk));
-        await drain(p, how);
-        if (!canSend(p, how)) throw new Error('closed');
-        rawSend(p, how, frame);
-      }
+      for (let i = 0; i < block.length; i += chunk) await sendChunk(stream, block.subarray(i, i + chunk));
       off += block.length;
       job.done = off;
       scheduleFeed();
@@ -878,6 +1026,7 @@ function renderPeers() {
   $('#peerList').innerHTML = peers.map(p => {
     const b = p.mode === 'p2p'
       ? (p.path === 'turn' ? ['p2p turn', '중계 연결 (TURN)'] : p.path === 'lan' ? ['p2p', '직접 연결 · 같은 네트워크'] : ['p2p', '직접 연결'])
+        .map((v, k) => (k === 1 && laneCount(p) > 1 ? `${v} · 통로 ${laneCount(p)}개` : v))
       : p.mode === 'relay' ? ['relay', '서버 경유 · 느릴 수 있음'] : ['', '연결하는 중'];
     const lock = p.key
       ? `<span class="lock on">${ICONS.lock}종단간 암호화</span>`
@@ -1419,13 +1568,39 @@ $('#nameForm').addEventListener('submit', e => {
 });
 
 // ---------- 전송 중 화면 꺼짐 방지, 나가기 경고 ----------
-let wakeLock = null;
-function busy() { return S.feed.some(it => ['sending', 'receiving', 'queued', 'wait', 'paused'].includes(it.state)); }
+// 대화 전송·폴더 동기화·앨범 원본 받기 중에는 화면과 PC가 잠들지 않게 함 (끝나면 바로 풀어 줌).
+// 브라우저는 탭이 가려지면 이 잠금을 스스로 풀기 때문에, 다시 보이면 다시 요청함
+let wakeLock = null, wakeAsking = false;
+function busy() {
+  const live = it => S.peers.has(it.peer || it.peerId);   // 멈춘 전송은 상대가 연결돼 있을 때만 (나간 기기를 기다리며 계속 켜 두지 않게)
+  if (S.feed.some(it => ['sending', 'receiving', 'queued', 'wait'].includes(it.state) || (it.state === 'paused' && live(it)))) return true;
+  if (typeof Sync !== 'undefined' && Sync.isBusy()) return true;
+  return typeof Album !== 'undefined' && Album.gets.size > 0;
+}
 async function keepAwake() {
   if (busy()) {
-    if (!wakeLock && navigator.wakeLock) { try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.onrelease = () => { wakeLock = null; }; } catch {} }
+    if (!wakeLock && !wakeAsking && navigator.wakeLock && !document.hidden) {
+      wakeAsking = true;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.onrelease = () => { wakeLock = null; renderAwake(); };
+      } catch {} finally { wakeAsking = false; }
+    }
   } else if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  holdBusyLock(busy());
+  renderAwake();
 }
+// 전송 중에는 웹 잠금을 잡아 둠: 브라우저가 가려진 탭을 잠재우거나(절전·효율 모드) 얼릴 때 이런 탭은 건너뜀
+let busyRelease = null;
+function holdBusyLock(on) {
+  if (on && !busyRelease && navigator.locks) {
+    const p = new Promise(r => { busyRelease = r; });
+    navigator.locks.request('omgyeo-transfer', () => p).catch(() => {});
+  } else if (!on && busyRelease) { busyRelease(); busyRelease = null; }
+}
+function renderAwake() { $('#awake').hidden = !wakeLock; }
+(function awakeLoop() { keepAwake(); fitHeight(); bgTimer(awakeLoop, 3000); })();   // 동기화처럼 따로 알려 주지 않는 작업도 시작·끝을 따라감
+document.addEventListener('visibilitychange', () => { if (!document.hidden) keepAwake(); });
 addEventListener('beforeunload', e => { if (busy()) { e.preventDefault(); e.returnValue = ''; } });
 
 // ---------- 받으면 알림 (다른 창을 보고 있을 때) ----------
@@ -1777,6 +1952,19 @@ $('#helpBtn').onclick = () => {
 $('#helpNav').addEventListener('click', e => { const b = e.target.closest('[data-help]'); if (b) showHelp(b.dataset.help); });
 $('#helpClose').onclick = () => $('#helpDlg').close();
 $('#helpDlg').addEventListener('click', e => { if (e.target.id === 'helpDlg') $('#helpDlg').close(); });
+
+// ---------- 화면 높이 맞추기 ----------
+// 일부 모바일 브라우저(삼성 인터넷 등)는 아래 도구 모음을 화면 높이(100dvh)에 빼지 않아서 입력창이 가려짐.
+// 실제로 보이는 높이를 재서 방 화면을 딱 맞춤 (키보드가 올라오면 그만큼 줄어듦)
+function fitHeight() {
+  const h = Math.round(window.visualViewport ? visualViewport.height : innerHeight);
+  if (h > 200) document.documentElement.style.setProperty('--app-h', `${h}px`);
+}
+fitHeight();
+addEventListener('resize', fitHeight);
+addEventListener('orientationchange', () => setTimeout(fitHeight, 300));
+if (window.visualViewport) visualViewport.addEventListener('resize', fitHeight);
+addEventListener('orientationchange', () => setTimeout(fitHeight, 300));
 
 // ---------- 시작 ----------
 (async function start() {
