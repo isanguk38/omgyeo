@@ -10,16 +10,25 @@ const FS_OK = typeof window.showDirectoryPicker === 'function' && !!globalThis.i
 const idb = (() => {
   let dbp = null;
   const open = () => dbp || (dbp = new Promise((resolve, reject) => {
-    const r = indexedDB.open('omgyeo', 2);
+    const r = indexedDB.open('omgyeo', 3);
     r.onupgradeneeded = () => {
       const db = r.result;
       if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
       if (!db.objectStoreNames.contains('hash')) db.createObjectStore('hash');
       // 연결(방)별 대화·파일 기록
       if (!db.objectStoreNames.contains('msgs')) db.createObjectStore('msgs', { keyPath: 'id' }).createIndex('room', 'room');
+      // 모임 앨범 (방별 사진 목록, 미리보기, 가지고 있는 원본)
+      if (!db.objectStoreNames.contains('album')) db.createObjectStore('album', { keyPath: 'k' }).createIndex('room', 'room');
     };
-    r.onsuccess = () => resolve(r.result);
+    r.onsuccess = () => {
+      const db = r.result;
+      // 다른 탭에서 새 버전이 저장소 구조를 바꾸려 하면 이 탭은 연결을 닫아 막지 않도록
+      db.onversionchange = () => { db.close(); dbp = null; if (typeof toast === 'function') toast('옮겨가 업데이트됐어요. 이 탭을 새로고침해 주세요.', 6000); };
+      resolve(db);
+    };
     r.onerror = () => reject(r.error);
+    // 예전 버전 탭이 열려 있어 구조 변경이 막힌 경우
+    r.onblocked = () => { if (typeof toast === 'function') toast('다른 탭에 예전 버전의 옮겨가 열려 있어요. 그 탭을 닫거나 새로고침하면 계속돼요.', 8000); };
   }));
   async function run(store, mode, fn) {
     const db = await open();
@@ -37,6 +46,10 @@ const idb = (() => {
     msgPut: rec => run('msgs', 'readwrite', s => { s.put(rec); }).catch(err => console.warn('idb msg', err)),
     msgList: room => run('msgs', 'readonly', s => s.index('room').getAll(room)).catch(() => []),
     msgDel: id => run('msgs', 'readwrite', s => { s.delete(id); }).catch(() => {}),
+    msgAll: () => run('msgs', 'readonly', s => s.getAll()).catch(() => []),
+    albumPut: rec => run('album', 'readwrite', s => { s.put(rec); }).catch(err => console.warn('idb album', err)),
+    albumList: room => run('album', 'readonly', s => s.index('room').getAll(room)).catch(() => []),
+    albumDel: k => run('album', 'readwrite', s => { s.delete(k); }).catch(() => {}),
     async msgDelRoom(room) {
       const db = await open();
       return new Promise(resolve => {

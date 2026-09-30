@@ -63,6 +63,14 @@
     <ul id="recentList"></ul>
     <p class="storage" id="storageInfo"></p>
   </section>
+  <div class="home-keep">
+  <section class="keeprow">
+    <h2>기록 보관</h2>
+    <label class="keep-label">파일 내용 보관 기간 <select class="keep-select" aria-label="파일 내용 보관 기간"></select></label>
+    <span class="keep-help"></span>
+    <div class="keep-confirm" hidden><span class="kc-text"></span><div class="kc-btns"><button type="button" class="solid" data-keep="ok">바꾸기</button><button type="button" data-keep="no">취소</button></div></div>
+    </section>
+  </div>
 </main>
 
 <!-- 연결 후: 한 화면 고정. 왼쪽 사이드바(연결·기기·저장 위치), 오른쪽 탭(대화 | 폴더 동기화) -->
@@ -101,6 +109,13 @@
       <div class="dlbtns" id="dlBtns"></div>
     </section>
 
+    <section class="keeprow">
+      <h2>기록 보관</h2>
+      <label class="keep-label">파일 내용 보관 기간 <select class="keep-select" aria-label="파일 내용 보관 기간"></select></label>
+      <span class="keep-help"></span>
+      <div class="keep-confirm" hidden><span class="kc-text"></span><div class="kc-btns"><button type="button" class="solid" data-keep="ok">바꾸기</button><button type="button" data-keep="no">취소</button></div></div>
+    </section>
+
     <button type="button" class="leave" id="leaveBtn">연결 끊고 나가기</button>
   </aside>
 
@@ -110,6 +125,7 @@
     <div class="panel">
       <div class="tabs" role="tablist" aria-label="보기">
         <button type="button" role="tab" id="tabChat" data-tab="chat" aria-selected="true" aria-controls="paneChat">대화</button>
+        <button type="button" role="tab" id="tabAlbum" data-tab="album" aria-selected="false" aria-controls="paneAlbum">모임 앨범<span class="tbadge" id="albumBadge" hidden></span></button>
         <button type="button" role="tab" id="tabSync" data-tab="sync" aria-selected="false" aria-controls="paneSync" hidden>폴더 동기화<span class="tbadge" id="syncBadge" hidden></span></button>
         <div class="tab-tools" id="chatTools">
           <button type="button" class="link" id="saveAllBtn" hidden>받은 파일 모두 저장</button>
@@ -140,6 +156,15 @@
           <textarea id="textInput" rows="1" placeholder="글, 링크, 계좌번호 보내기" aria-label="보낼 글"></textarea>
           <button type="submit" class="send">보내기</button>
         </form>
+      </div>
+
+      <div class="tabpane" id="paneAlbum" role="tabpanel" aria-labelledby="tabAlbum" hidden>
+        <div class="alb-bar">
+          <div class="alb-info"><b>모임 앨범</b><span id="albInfo">아직 사진이 없어요</span></div>
+          <div class="alb-actions" id="albActions"></div>
+        </div>
+        <div class="alb-body" id="albBody"></div>
+        <input type="file" id="albInput" accept="image/*,video/*" multiple hidden>
       </div>
 
       <div class="tabpane" id="paneSync" role="tabpanel" aria-labelledby="tabSync" hidden>
@@ -185,5 +210,6 @@
 <script src="/fsutil.js"></script>
 <script src="/app.js"></script>
 <script src="/sync.js"></script>
+<script src="/album.js"></script>
 </body>
 </html>

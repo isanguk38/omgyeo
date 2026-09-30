@@ -89,8 +89,10 @@ async function grantShare() {
   scanShare();
   for (const p of S.peers.values()) if (isTarget(p)) offer(p);
 }
+function cancelPush(sess) { sess.cancelled = true; wakeAll(sess); }
 function stopAll() {
   for (const sess of Sync.sessions.values()) {
+    cancelPush(sess);
     const p = S.peers.get(sess.peerId);
     if (p) sendCtrl(p, { t: 'sync-stop', sid: Sync.share.id }).catch(() => {});
   }
@@ -159,6 +161,7 @@ async function startWith(peerId) {
 async function stopWith(pid) {
   const sess = Sync.sessions.get(pid);
   const p = sess && S.peers.get(sess.peerId);
+  if (sess) cancelPush(sess);   // 진행 중인 전송을 즉시 멈춤 (남은 파일을 헛되이 보내지 않도록)
   if (p) sendCtrl(p, { t: 'sync-stop', sid: Sync.share.id }).catch(() => {});
   Sync.sessions.delete(pid);
   Sync.share.targets = Sync.share.targets.filter(x => x !== pid);
@@ -193,7 +196,8 @@ async function push(sess) {
   sess.inflight = 0; sess.pending.clear();
   sess.lastAck = Date.now();
   syncRender();
-  const aliveNow = () => S.peers.get(sess.peerId) === p;
+  sess.cancelled = false;
+  const aliveNow = () => S.peers.get(sess.peerId) === p && !sess.cancelled;
   // 확인 응답을 기다림. 응답이 SYNC_STALL 동안 없으면 멈춘 것으로 보고 중단 (영원히 기다리지 않음)
   const waitAcks = async done => {
     const started = Date.now();
@@ -225,6 +229,7 @@ async function push(sess) {
       for (let off = 0; off < file.size; off += READ_BLOCK) {
         const block = new Uint8Array(await file.slice(off, off + READ_BLOCK).arrayBuffer());
         for (let i = 0; i < block.length; i += chunk) {
+          if (sess.cancelled) throw new Error('cancelled');
           const frame = await frameChunk(p, fid, block.subarray(i, i + chunk));
           await drain(p, how);
           if (!canSend(p, how)) throw new Error('closed');
@@ -243,7 +248,8 @@ async function push(sess) {
   } catch (err) {
     console.warn('push', err);
     stalled = aliveNow();
-    if (!stalled) toast('동기화가 중간에 끊겼어요. 다시 연결되면 남은 것만 이어서 맞춰요.');
+    if (sess.cancelled) toast(`${sess.name}와의 폴더 공유를 끊고 전송을 멈췄어요`);
+    else if (!stalled) toast('동기화가 중간에 끊겼어요. 다시 연결되면 남은 것만 이어서 맞춰요.');
   }
   const pg = sess.prog;
   if (pg && pg.files.length) {
@@ -444,6 +450,8 @@ function inStop(sid, notify) {
   const s = Sync.inbound.get(sid);
   if (!s) return;
   clearInterval(s.timer);
+  for (const [key, st] of Sync.fidMap) if (st.s === s) { Sync.fidMap.delete(key); st.w.abort().catch(() => {}); }
+  flushCache(s);
   Sync.inbound.delete(sid);
   if (notify) toast(`${s.peerName}이(가) '${s.name}' 폴더 공유를 멈췄어요`);
   syncRender();

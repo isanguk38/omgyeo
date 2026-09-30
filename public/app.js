@@ -19,6 +19,14 @@ const P2P_WAIT = 6000;               // 직접 연결을 기다리는 시간
 const MAX_RETRY = 8;                 // 같은 기기에 연결된 상태에서 재시도 횟수
 const ZIP_LIMIT = 0xFFFFFFFF;        // zip(비압축, zip64 미지원) 한계
 const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+// 서버가 알려 주는 연결 경로 정보 (TURN 키가 설정돼 있으면 가까운 중계 서버 포함). 6시간마다 새로 받음
+const ICECFG = { servers: ICE, turn: false, at: 0 };
+async function loadIce() {
+  try {
+    const j = await (await fetch('/api/ice', { signal: AbortSignal.timeout(4000) })).json();
+    if (Array.isArray(j.iceServers) && j.iceServers.length) Object.assign(ICECFG, { servers: j.iceServers, turn: !!j.turn, at: Date.now() });
+  } catch {}
+}
 
 // ---------- 저장소 ----------
 const store = {
@@ -269,6 +277,7 @@ function addPeer(info, initiator) {
   p.keyP = deriveKey(p);
   setTimeout(() => { if (alive(p) && typeof Sync !== 'undefined') Sync.onPeerJoined(p); }, 0);
   setTimeout(() => sendTombs(p), 500);
+  setTimeout(() => { if (alive(p) && typeof Album !== 'undefined') Album.onPeerJoined(p); }, 800);
 
   // 끊겼다 돌아온 기기면 멈춘 전송을 이어서
   const back = S.parked.filter(j => j.dev === p.dev);
@@ -280,7 +289,8 @@ function addPeer(info, initiator) {
   } else if (!initiator) toast(`${p.name} 연결됨`);
 
   if (typeof RTCPeerConnection === 'undefined') { p.mode = 'relay'; return; }
-  const pc = p.pc = new RTCPeerConnection({ iceServers: ICE });
+  if (Date.now() - ICECFG.at > 6 * 3600e3) loadIce();   // 다음 연결부터 새 정보 사용
+  const pc = p.pc = new RTCPeerConnection({ iceServers: ICECFG.servers });
   pc.onicecandidate = e => { if (e.candidate) sendServer({ type: 'signal', to: p.id, data: { candidate: e.candidate } }); };
   pc.ondatachannel = e => { p.dc = e.channel; setupChannel(p); };
   pc.onconnectionstatechange = () => {
@@ -294,13 +304,13 @@ function addPeer(info, initiator) {
       .then(() => sendServer({ type: 'signal', to: p.id, data: { sdp: pc.localDescription } }))
       .catch(err => console.warn('offer', err));
   }
-  p.timer = setTimeout(() => { if (p.mode === 'connecting') { p.mode = 'relay'; renderPeers(); } }, P2P_WAIT);
+  p.timer = setTimeout(() => { if (p.mode === 'connecting') { p.mode = 'relay'; renderPeers(); } }, ICECFG.turn ? P2P_WAIT + 4000 : P2P_WAIT);
 }
 function setupChannel(p) {
   const dc = p.dc;
   dc.binaryType = 'arraybuffer';
   dc.bufferedAmountLowThreshold = LOW_WATER;
-  dc.onopen = () => { p.mode = 'p2p'; clearTimeout(p.timer); renderPeers(); };
+  dc.onopen = () => { p.mode = 'p2p'; clearTimeout(p.timer); renderPeers(); setTimeout(() => detectPath(p), 300); };
   dc.onclose = () => {
     if (!alive(p)) return;
     if (p.mode === 'p2p') { p.mode = 'relay'; renderPeers(); }
@@ -325,9 +335,25 @@ async function onSignal(from, d) {
     }
   } catch (err) { console.warn('signal', err); }
 }
+// 실제로 어느 길로 연결됐는지 확인: 같은 네트워크 직접 / 인터넷 직접 / TURN 중계
+async function detectPath(p) {
+  if (!p.pc || !alive(p)) return;
+  try {
+    const st = await p.pc.getStats();
+    let pair = null;
+    st.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = st.get(r.selectedCandidatePairId); });
+    if (!pair) st.forEach(r => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+    if (!pair) return;
+    const lc = st.get(pair.localCandidateId), rc = st.get(pair.remoteCandidateId);
+    p.path = (lc && lc.candidateType === 'relay') || (rc && rc.candidateType === 'relay') ? 'turn'
+      : lc && rc && lc.candidateType === 'host' && rc.candidateType === 'host' ? 'lan' : 'direct';
+    renderPeers();
+  } catch {}
+}
 function closePeer(p) {
   clearTimeout(p.timer);
   if (typeof Sync !== 'undefined') Sync.onPeerLeft(p);
+  if (typeof Album !== 'undefined') Album.onPeerLeft(p);
   rejectAll(p);
   try { p.dc && p.dc.close(); } catch {}
   try { p.pc && p.pc.close(); } catch {}
@@ -411,6 +437,7 @@ async function handleFrame(p, u8) {
 }
 function onCtrl(p, m) {
   if (typeof m.t === 'string' && m.t.startsWith('sync-')) return typeof Sync !== 'undefined' ? Sync.onCtrl(p, m) : undefined;
+  if (typeof m.t === 'string' && m.t.startsWith('alb-')) return typeof Album !== 'undefined' ? Album.onCtrl(p, m) : undefined;
   switch (m.t) {
     case 'file': return onFileOffer(p, m);
     case 'resume': return settle(p, `resume:${m.uid}`, m.from);
@@ -617,6 +644,7 @@ async function onFileOffer(p, m) {
 async function onChunk(p, fid, data) {
   const key = `${p.id}:${fid}`;
   if (typeof Sync !== 'undefined' && Sync.fidMap.has(key)) return Sync.onChunk(p, fid, data);
+  if (typeof Album !== 'undefined' && Album.fidMap.has(key)) return Album.onChunk(p, fid, data);
   const inc = S.fidMap.get(key);
   if (!inc || inc.state !== 'receiving') return;
   if (inc.writer) {
@@ -841,7 +869,9 @@ function renderPeers() {
   $('#peerCount').textContent = peers.length;
   $('#emptyPeers').hidden = peers.length > 0;
   $('#peerList').innerHTML = peers.map(p => {
-    const b = p.mode === 'p2p' ? ['p2p', '직접 연결'] : p.mode === 'relay' ? ['relay', '서버 경유'] : ['', '연결하는 중'];
+    const b = p.mode === 'p2p'
+      ? (p.path === 'turn' ? ['p2p turn', '중계 연결 (TURN)'] : p.path === 'lan' ? ['p2p', '직접 연결 · 같은 네트워크'] : ['p2p', '직접 연결'])
+      : p.mode === 'relay' ? ['relay', '서버 경유 · 느릴 수 있음'] : ['', '연결하는 중'];
     const lock = p.key
       ? `<span class="lock on">${ICONS.lock}종단간 암호화</span>`
       : `<span class="lock off">${ICONS.unlock}${CRYPTO_OK && p.pub ? '암호화 준비 중' : '암호화 안 됨'}</span>`;
@@ -1025,13 +1055,22 @@ function restoreItem(r) {
         if (it.mime.startsWith('image/')) it.thumb = it.url;
         it.shown = {}; scheduleFeed();
       }).catch(() => { it.gone = 'disk'; it.shown = {}; scheduleFeed(); });
-    } else it.gone = 'big';
+    } else it.gone = r.cleaned ? 'cleaned' : 'big';
+    markExpiry(it, r);
     return it;
   }
   const files = (r.files || []).map(f => ({ ...f, dir: r.dir, state: 'done', done: f.size, onDisk: !!f.fh }));
   const it = { ...base, name: r.name, count: files.length, size: r.size, total: r.size, done: r.size, state: 'done', diskName: r.diskName, files, jobs: files };
-  if (files.some(f => !f.blob && !f.fh)) it.partial = true;
+  if (files.some(f => !f.blob && !f.fh)) { it.partial = true; it.cleaned = !!r.cleaned; }
+  markExpiry(it, r);
   return it;
+}
+// 보관 기간이 3일 안으로 남은 파일에 "N일 뒤 내용 정리" 표시
+function markExpiry(it, r) {
+  const days = keepDays();
+  if (!days || !hasContent(r)) return;
+  const left = days - (Date.now() - r.time) / 864e5;
+  if (left <= 3) it.expireIn = Math.max(0, Math.ceil(left));
 }
 // 기록이 많아도 대화창이 무거워지지 않게 최근 100개만 먼저 그리고, 위에서 더 불러옴
 const HIST_PAGE = 100;
@@ -1072,6 +1111,7 @@ function showRoom(room) {
   S.hist = null;
   S.shownRoom = room;
   if (room) loadRoomHistory(room);
+  if (typeof Album !== 'undefined') Album.load(room);
 }
 
 // ---------- 지우기: 상대 기기에서도 지워지도록 ----------
@@ -1200,6 +1240,7 @@ function updateItem(it) {
     if (it.kind === 'bundle') sz = `${it.doneCount}/${it.count}개 · ${sz}`;
   } else if (it.state === 'paused' && it.size) sz = `${Math.floor(pct)}%에서 멈춤 · ${fmtSize(it.size)}`;
   if (it.resumed && it.state !== 'done') sz += it.dir === 'out' ? ' · 이어서 보내는 중' : ' · 이어받는 중';
+  if (it.expireIn != null && it.state === 'done' && !it.gone) sz += it.expireIn ? ` · ${it.expireIn}일 뒤 내용 정리` : ' · 곧 내용 정리';
   if (it.shown.sz !== sz) { r.sz.textContent = sz; it.shown.sz = sz; }
   r.bar.hidden = !['sending', 'receiving', 'queued', 'wait', 'paused'].includes(it.state);
   r.bar.classList.toggle('paused', it.state === 'paused');
@@ -1219,13 +1260,15 @@ function updateItem(it) {
   const delBtn = finished(it) ? '<button type="button" class="del-btn" data-a="del" title="모두에게서 삭제">삭제</button>' : '';
   if (it.state === 'done' && it.gone) {
     r.act.innerHTML = it.gone === 'big' ? '<span class="st">기록만 남음 · 파일이 커서 내용은 보관하지 않았어요</span>'
+      : it.gone === 'cleaned' ? '<span class="st">보관 기간이 지나 파일 내용을 정리했어요 · 이름과 기록은 남아요</span>'
       : '<span class="st">저장 폴더에서 파일을 찾지 못했어요</span>';
   } else if (it.state === 'done') {
     if (it.dir === 'out') r.act.innerHTML = '<span class="st done">전달 완료</span>';
     else if (it.kind === 'bundle' && it.files.every(f => f.onDisk)) {
       r.act.innerHTML = `<span class="st done">'${esc(it.diskName || it.name)}' 폴더에 저장됨</span>`;
     } else if (it.kind === 'bundle' && it.partial) {
-      r.act.innerHTML = '<span class="st">기록만 남음 · 폴더가 커서 일부 내용은 보관하지 않았어요</span>';
+      r.act.innerHTML = it.cleaned ? '<span class="st">보관 기간이 지나 폴더 내용을 정리했어요 · 기록은 남아요</span>'
+        : '<span class="st">기록만 남음 · 폴더가 커서 일부 내용은 보관하지 않았어요</span>';
     } else if (it.kind === 'bundle') {
       const zipOk = it.size < ZIP_LIMIT && it.count < 65535;
       r.act.innerHTML = (zipOk ? `<button type="button" class="${it.saved ? '' : 'solid'}" data-a="zip">${it.saved ? 'zip 다시 저장' : 'zip으로 저장'}</button>` : '') +
@@ -1333,11 +1376,13 @@ addEventListener('drop', e => {
   e.preventDefault(); dragDepth = 0; $('#dropVeil').hidden = true;
   const dt = e.dataTransfer;
   const pending = entriesFromDrop(dt);   // webkitGetAsEntry는 이벤트 안에서 바로 불러야 해서 먼저 호출
+  if (albumTabOpen()) return albUpload(dt.files);
   pending.then(sendEntries).catch(() => toast('폴더를 읽지 못했어요.'));
 });
 addEventListener('paste', e => {
   if (!S.room || !e.clipboardData || !e.clipboardData.files.length) return;
   e.preventDefault();
+  if (albumTabOpen()) return albUpload(e.clipboardData.files);
   sendEntries(toEntries(e.clipboardData.files));
 });
 
@@ -1443,10 +1488,18 @@ $('#notifyNo').onclick = () => { store.set('omgyeo.notifyAsked', Date.now()); re
 // ---------- 사진·영상 크게 보기 ----------
 const V = { list: [], i: 0, x: null };
 const isMedia = it => it.kind === 'file' && /^(image|video)\//.test(it.mime || '') && (it.dir === 'out' ? !!it.file : it.state === 'done' && !!it.url);
+const albumTabOpen = () => !!$('#paneAlbum') && !$('#paneAlbum').hidden;
 function mediaUrl(it) {
+  if (it.album) return it.url;
   if (it.dir === 'in') return it.url;
   if (!it.viewUrl) it.viewUrl = it.thumb || URL.createObjectURL(it.file);
   return it.viewUrl;
+}
+function openViewerList(list, i) {
+  V.list = list; V.i = i;
+  $('#viewer').hidden = false;
+  document.body.classList.add('noscroll');
+  drawViewer();
 }
 function openViewer(it) {
   V.list = S.feed.filter(isMedia);   // 오래된 것부터
@@ -1468,6 +1521,7 @@ function drawViewer() {
   $('#vName').textContent = it.name;
   $('#vMeta').textContent = `${V.i + 1} / ${V.list.length} · ${it.dir === 'in' ? '←' : '→'} ${it.peerName} · ${fmtSize(it.size)}`;
   $('#vSave').hidden = it.dir !== 'in';
+  $('#vSave').textContent = it.album ? '원본 저장' : '저장';
   $('#vPrev').disabled = V.i === 0;
   $('#vNext').disabled = V.i === V.list.length - 1;
 }
@@ -1475,7 +1529,11 @@ function stepViewer(d) { const n = V.i + d; if (n >= 0 && n < V.list.length) { V
 $('#vPrev').onclick = () => stepViewer(-1);
 $('#vNext').onclick = () => stepViewer(1);
 $('#vClose').onclick = closeViewer;
-$('#vSave').onclick = async () => { const it = V.list[V.i]; if (it && await saveBlobs([it])) { it.saved = true; scheduleFeed(); } };
+$('#vSave').onclick = async () => {
+  const it = V.list[V.i];
+  if (it && it.album) return albSave([it.id]);
+  if (it && await saveBlobs([it])) { it.saved = true; scheduleFeed(); }
+};
 $('#viewer').addEventListener('click', e => { if (e.target.id === 'viewer') closeViewer(); });
 addEventListener('keydown', e => {
   if ($('#viewer').hidden) return;
@@ -1538,6 +1596,8 @@ function selectTab(name) {
   for (const t of document.querySelectorAll('.tabs [role=tab]')) t.setAttribute('aria-selected', String(t.dataset.tab === name));
   $('#paneChat').hidden = name !== 'chat';
   $('#paneSync').hidden = name !== 'sync';
+  $('#paneAlbum').hidden = name !== 'album';
+  if (name === 'album' && typeof Album !== 'undefined') { Album.unseen = 0; albRender(); }
   $('#chatTools').hidden = name !== 'chat';
   if (name === 'chat' && stick) nextFrame(scrollBottom);
 }
@@ -1551,6 +1611,74 @@ let resizeTimer;
 addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (S.room) renderPeers(); }, 200); });
 $('#sideToggle').onclick = () => { S.sideTouched = true; setSide(!document.body.classList.contains('side-open')); };
 
+// ---------- 오래된 기록 자동 정리 ----------
+// 기본은 "계속 보관". 사용자가 기간을 고르면 그보다 오래된 파일의 "내용"만 정리하고
+// 메시지와 파일 이름은 남김. 정리 3일 전부터 파일에 표시하고, 기간을 바꿀 때 바로 정리될 게 있으면 먼저 물어봄.
+const KEEP_OPTIONS = [[0, '계속 보관'], [7, '7일'], [30, '30일'], [90, '90일']];
+const keepDays = () => Number(store.get('omgyeo.keepDays', 0)) || 0;
+const hasContent = r => !!(r.blob || (r.files && r.files.some(f => f.blob)));
+async function countToClean(days) {
+  if (!days) return 0;
+  const cutoff = Date.now() - days * 864e5;
+  return (await idb.msgAll()).filter(r => (!r.owner || r.owner === PERSIST_ID) && r.time < cutoff && hasContent(r)).length;
+}
+async function cleanupOld() {
+  const days = keepDays();
+  if (!days) return 0;
+  const cutoff = Date.now() - days * 864e5;
+  let n = 0;
+  for (const r of await idb.msgAll()) {
+    if ((r.owner && r.owner !== PERSIST_ID) || r.time >= cutoff || !hasContent(r)) continue;
+    delete r.blob;
+    if (r.files) for (const f of r.files) delete f.blob;
+    r.cleaned = Date.now();
+    await idb.msgPut(r);
+    n++;
+  }
+  if (n) {
+    toast(`보관 기간(${days}일)이 지난 파일 ${n}개의 내용을 정리했어요. 메시지와 파일 이름은 그대로 남아 있어요.`, 5000);
+    if (S.room && S.shownRoom) { const room = S.shownRoom; S.shownRoom = null; showRoom(room); }
+  }
+  return n;
+}
+function keepHelpText(days) {
+  return days
+    ? `${days}일이 지난 파일은 내용을 자동으로 정리해요. 메시지와 파일 이름은 남고, 정리 3일 전부터 파일에 표시돼요. 계속 필요한 파일은 미리 저장해 두세요.`
+    : '주고받은 파일 내용을 계속 보관해요. 저장 용량이 늘어나면 보관 기간을 정해 두세요.';
+}
+function renderKeep() {
+  const days = keepDays();
+  for (const sel of document.querySelectorAll('.keep-select')) {
+    if (!sel.options.length) sel.innerHTML = KEEP_OPTIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+    sel.value = String(days);
+  }
+  for (const el of document.querySelectorAll('.keep-help')) el.textContent = keepHelpText(days);
+  for (const el of document.querySelectorAll('.keep-confirm')) el.hidden = true;
+}
+document.addEventListener('change', async e => {
+  const sel = e.target.closest('.keep-select');
+  if (!sel) return;
+  const days = Number(sel.value);
+  const n = await countToClean(days);
+  const box = sel.closest('.keeprow').querySelector('.keep-confirm');
+  if (n) {   // 바로 정리될 파일이 있으면 먼저 물어봄
+    box.hidden = false;
+    box.querySelector('.kc-text').textContent = `지금 바로 파일 ${n}개의 내용이 정리돼요 (${days}일보다 오래된 파일). 이 기간으로 바꿀까요?`;
+    box.dataset.days = String(days);
+    return;
+  }
+  store.set('omgyeo.keepDays', days);
+  renderKeep();
+  toast(days ? `보관 기간을 ${days}일로 정했어요` : '파일 내용을 계속 보관해요');
+});
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-keep]');
+  if (!b) return;
+  const box = b.closest('.keep-confirm');
+  if (b.dataset.keep === 'ok') { store.set('omgyeo.keepDays', Number(box.dataset.days)); renderKeep(); await cleanupOld(); }
+  else renderKeep();
+});
+
 // ---------- 시작 ----------
 (async function start() {
   // 앱 화면을 캐시해 두어 서버가 잠들어 있어도 화면은 바로 뜨게 함
@@ -1562,9 +1690,11 @@ $('#sideToggle').onclick = () => { S.sideTouched = true; setSide(!document.body.
   show('home');
   setNet(false);
   if (!globalThis.isSecureContext) $('#secureNote').hidden = false;
-  await initCrypto();
+  await Promise.all([initCrypto(), loadIce()]);
   connect();
   loadInfo();
   loadDl();
   renderBell();
+  renderKeep();
+  setTimeout(cleanupOld, 3000);
 })();

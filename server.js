@@ -28,6 +28,46 @@ function lanAddresses() {
   return out.sort((a, b) => rank(a) - rank(b));
 }
 
+// ---------- 연결 경로 정보 (STUN + 선택적으로 TURN) ----------
+// 직접 연결이 막힌 네트워크에서는 TURN(가까운 전송 전용 중계 서버)을 거쳐 연결.
+// 키가 없으면 STUN만 알려 주고, 그때는 지금처럼 우리 서버 경유로 넘어감.
+//   Cloudflare:  CF_TURN_KEY_ID, CF_TURN_API_TOKEN
+//   Metered:     METERED_DOMAIN(예: myapp.metered.live), METERED_API_KEY
+//   직접 지정:   TURN_URLS(쉼표로 구분), TURN_USERNAME, TURN_CREDENTIAL
+const STUN = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+let iceCache = null;
+async function iceServers() {
+  if (iceCache && iceCache.exp > Date.now()) return iceCache;
+  const env = process.env;
+  let list = [...STUN], turn = false, ttl = 6 * 3600e3;
+  try {
+    if (env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN) {
+      const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.CF_TURN_KEY_ID}/credentials/generate`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.CF_TURN_API_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttl: 86400 }),
+        signal: AbortSignal.timeout(5000),
+      });
+      const j = await r.json();
+      if (j.iceServers) { list.push(...[].concat(j.iceServers)); turn = true; }
+      else console.warn('Cloudflare TURN 응답을 해석하지 못했어요', r.status);
+    } else if (env.METERED_DOMAIN && env.METERED_API_KEY) {
+      const r = await fetch(`https://${env.METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${encodeURIComponent(env.METERED_API_KEY)}`, { signal: AbortSignal.timeout(5000) });
+      const j = await r.json();
+      if (Array.isArray(j) && j.length) { list = [...STUN, ...j]; turn = true; }
+      else console.warn('Metered TURN 응답을 해석하지 못했어요', r.status);
+    } else if (env.TURN_URLS) {
+      list.push({ urls: env.TURN_URLS.split(',').map(s => s.trim()).filter(Boolean), username: env.TURN_USERNAME, credential: env.TURN_CREDENTIAL });
+      turn = true;
+    }
+  } catch (err) {
+    console.warn('TURN 정보를 받지 못했어요:', err.message);
+    ttl = 60e3;   // 실패하면 1분 뒤 다시 시도
+  }
+  iceCache = { iceServers: list, turn, exp: Date.now() + ttl };
+  return iceCache;
+}
+
 // ngrok이 이 포트를 열어 두었으면 그 공개 주소를 QR에 쓰도록 알려 줌 (ngrok 로컬 API: 4040)
 async function ngrokUrl() {
   try {
@@ -48,6 +88,12 @@ async function handle(req, res) {
     const pub = await ngrokUrl();
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ lan: lanAddresses().map(ip => `${proto}://${ip}:${PORT}`), public: pub }));
+  }
+
+  if (url.pathname === '/api/ice') {
+    const ice = await iceServers();
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ iceServers: ice.iceServers, turn: ice.turn }));
   }
 
   if (url.pathname === '/qr.svg') {
