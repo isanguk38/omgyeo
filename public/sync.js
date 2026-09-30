@@ -832,7 +832,13 @@ Sync.onPeerJoined = p => {
   syncRender();
 };
 Sync.onPeerLeft = p => {
-  for (const sess of Sync.sessions.values()) if (sess.peerId === p.id) { sess.state = 'away'; wakeAll(sess); }
+  for (const sess of Sync.sessions.values()) {
+    if (sess.peerId !== p.id) continue;
+    // 동기화 확인 중이었다면 바로 멈추고 알림 (다시 연결되면 자동으로 비교함)
+    if (sess.checking) toast(`${sess.name}이(가) 연결을 끊어서 동기화 확인을 멈췄어요. 다시 연결되면 자동으로 비교해요.`, 5000);
+    Object.assign(sess, { state: 'away', checking: false, remoteScan: null, busy: false });
+    wakeAll(sess);
+  }
   for (const [key, u] of Sync.fidMap) {
     if (!key.startsWith(`${p.id}:`)) continue;
     abortUnit(u);   // 쓰다 만 파일은 원래 내용 그대로 둠
@@ -944,7 +950,8 @@ function peerRow(sess) {
   let st = '', btn = '';
   const canPush = sess.state === 'ready' && hasWork(sess) && !sess.checking;
   const phase = checkPhase(sess);
-  if ((sess.checking || sess.state === 'offer' || (sess.state === 'ready' && !sess.remote)) && phase) st = `<span class="busy"><span class="spin"></span>${phase}</span>`;
+  if (sess.state === 'away') st = '연결 끊김 · 다시 연결되면 이어서 맞춰요';
+  else if ((sess.checking || sess.state === 'offer' || (sess.state === 'ready' && !sess.remote)) && phase) st = `<span class="busy"><span class="spin"></span>${phase}</span>`;
   else if (sess.checking) st = '<span class="busy"><span class="spin"></span>동기화 확인 중…</span>';
   else if (sess.state === 'offer') st = '<span class="busy"><span class="spin"></span>요청 보냄 · 상대 PC가 확인하는 중</span>';
   else if (sess.state === 'waiting') st = '상대가 받을 위치를 고르는 중';
