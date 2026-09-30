@@ -2,6 +2,8 @@
 
 폰·PC·태블릿 사이에서 파일과 글을 원본 그대로 주고받는 웹앱입니다. 기종과 방향에 상관없이 됩니다(아이폰 ↔ 갤럭시, 폰 ↔ PC, PC ↔ PC).
 
+**바로 쓰기: [https://omgyeo.onrender.com](https://omgyeo.onrender.com)** — 설치·가입 없이 두 기기에서 열고 6자리 코드로 연결하세요.
+
 ## 실행
 
 ```bash
@@ -121,7 +123,7 @@ zip으로 묶지 않고 폴더를 통째로 맞춥니다. 처음엔 전부, 그�
 1. 이 폴더를 GitHub 저장소로 올립니다.
 2. [Render](https://render.com)에 GitHub 계정으로 가입합니다.
 3. **New → Blueprint**를 누르고 저장소를 고르면 `render.yaml` 설정대로 무료 웹 서비스가 만들어집니다.
-4. 몇 분 뒤 `https://omgyeo-xxxx.onrender.com` 같은 주소가 생깁니다.
+4. 몇 분 뒤 `https://omgyeo-xxxx.onrender.com` 같은 주소가 생깁니다. (지금 운영 중인 주소: https://omgyeo.onrender.com)
 
 무료 플랜은 15분 동안 접속이 없으면 잠들고, 다음 첫 접속 때 깨어나는 데 30초~1분이 걸립니다. GitHub에 새로 올리면 자동으로 다시 배포됩니다.
 
