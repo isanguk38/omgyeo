@@ -357,6 +357,7 @@ async function push(sess) {
   let stalled = false;
   try {
     await p.keyP;
+    sendCtrl(p, { t: 'sync-plan', sid, total: list.length, bytes: sess.diff.bytes }).catch(() => {});   // 받는 쪽도 전체 대비 진행률을 보여 주도록
     if (dels.length) await sendCtrl(p, { t: 'sync-del', sid, paths: dels });
     for (const u of planUnits(list)) {
       await waitAcks(() => sess.inflight <= SYNC_WINDOW);
@@ -577,6 +578,9 @@ async function closeRecv(st) {
   s.cache[st.path] = [file.size, file.lastModified, st.hash];   // 받은 파일은 다시 해시하지 않도록
   clearTimeout(s.cacheTimer); s.cacheTimer = setTimeout(() => flushCache(s), 1000);
   s.count++; s.applied++; s.last = Date.now();
+  if (!st.existed && s.fileCount != null) s.fileCount++;   // 새로 생긴 파일만큼 '폴더 파일' 개수도 바로 반영
+  if (s.plan) { s.plan.done++; s.plan.saved += st.size; s.plan.at = Date.now(); s.plan.last = st.path; }
+  if (Date.now() - (s.drawAt || 0) > 400) { s.drawAt = Date.now(); syncRender(); }   // 받는 쪽 화면도 파일마다 (0.4초에 한 번) 갱신
   let d = null;
   if (isTextPath(st.path) && (!st.existed || st.oldText != null)) {
     const newText = await readTextMaybe(file);
@@ -592,6 +596,39 @@ function sendAcks(p, sid, items, errs) {
   let budget = 700 * 1024;
   for (const it of items) { const n = it.diff ? it.diff.length : 0; if (n > budget) it.diff = null; else budget -= n; }
   sendCtrl(p, { t: 'sync-acks', sid, items, errs }).catch(() => {});
+}
+// 받는 쪽 진행 표시: 1초마다 속도·남은 시간 갱신
+function recvTicker(s) {
+  if (s.ticking) return;
+  s.ticking = true;
+  const tick = () => {
+    const pl = s.plan;
+    if (!pl || !recvActive(s)) { s.ticking = false; syncRender(); return; }
+    pl.hist.push([Date.now(), pl.saved, pl.done]);
+    if (pl.hist.length > 20) pl.hist.shift();
+    syncRender();
+    bgTimer(tick, 1000);
+  };
+  bgTimer(tick, 1000);
+}
+const recvActive = s => s.plan && s.plan.done < s.plan.total && Date.now() - s.plan.at < 60000 && S.peers.has(s.peerId);
+function recvProgress(s) {
+  const pl = s.plan;
+  const EQ = 256 * 1024;
+  const totalWork = pl.bytes + pl.total * EQ, work = Math.min(totalWork, pl.saved + pl.done * EQ);
+  const pct = totalWork ? (work / totalWork) * 100 : 0;
+  let rate = 0, left = null;
+  if (pl.hist.length > 2) {
+    const [t0, b0, f0] = pl.hist[0], [t1, b1, f1] = pl.hist[pl.hist.length - 1];
+    const dt = Math.max(1, (t1 - t0) / 1000);
+    rate = (b1 - b0) / dt;
+    const workRate = ((b1 - b0) + (f1 - f0) * EQ) / dt;
+    if (workRate > 0) left = (totalWork - work) / workRate;
+  }
+  const idle = Math.round((Date.now() - pl.at) / 1000);
+  return `<span class="busy">받는 중 ${pl.done.toLocaleString()}/${pl.total.toLocaleString()}개 · 저장됨 ${fmtSize(pl.saved)} / ${fmtSize(pl.bytes)}${rate >= 1024 ? ` · 초당 ${fmtSize(rate)}` : ''} · 남은 시간 ${left != null ? fmtDuration(left) : '다시 계산하는 중'}</span>`
+    + `<span class="pr-bar"><i style="width:${pct.toFixed(1)}%"></i></span>`
+    + `<small class="pr-now">${idle >= 5 ? `<span class="pr-wait">다음 파일을 기다리는 중 · ${idle}초째</span>` : pl.last ? `저장한 파일: <span class="pr-files">${esc(pl.last)}</span>` : ''}</small>`;
 }
 // 받는 동안 "살아 있음" 신호: 큰 파일을 마무리 저장하거나 밀린 조각을 처리하느라 완료 응답이 늦어도
 // 보내는 쪽이 멈춘 것으로 오해해 처음부터 다시 보내지 않게 함 (일한 양 work가 늘었는지 함께 보냄)
@@ -808,6 +845,11 @@ Sync.onCtrl = async (p, m) => {
     // 받는 쪽
     case 'sync-offer': return inOffer(p, m);
     case 'sync-check': { const s2 = Sync.inbound.get(m.sid); if (s2 && s2.peerId === p.id) inIndex(s2, true); return; }
+    case 'sync-plan': {   // 보내는 쪽이 이번에 보낼 개수·용량
+      const s2 = Sync.inbound.get(m.sid);
+      if (s2 && s2.peerId === p.id) { s2.plan = { total: Math.max(0, Number(m.total) || 0), bytes: Math.max(0, Number(m.bytes) || 0), done: 0, saved: 0, at: Date.now(), hist: [], last: '' }; recvTicker(s2); syncRender(); }
+      return;
+    }
     case 'sync-file': return inFile(p, m);
     case 'sync-batch': return inBatch(p, m);
     case 'sync-end': return inEnd(p, m);
@@ -924,7 +966,7 @@ function drawSync() {
 
   // 받는 폴더
   for (const s of Sync.inbound.values()) {
-    const st = {
+    const st = recvActive(s) && ['ready', 'receiving'].includes(s.state) ? recvProgress(s) : {
       ask: `<b>${esc(s.peerName)}</b>이(가) <b>'${esc(s.name)}'</b> 폴더를 보내려고 해요. 고른 위치 안에 '${esc(s.name)}' 폴더를 만들어 받아요.`,
       perm: `전에 고른 받을 폴더 <b>'${esc(s.name)}'</b>는 그대로 기억하고 있어요. 브라우저 보안 때문에 새로고침하거나 브라우저를 다시 열면 [폴더 접근 허용]을 한 번 더 눌러야 해요. 크롬 창에서 <b>'방문할 때마다 허용'</b>을 고르면 다음부터는 묻지 않아요.`,
       ready: s.scanProg ? `<span class="busy">받는 폴더 확인 중 ${s.scanProg.d.toLocaleString()} / ${s.scanProg.n.toLocaleString()}개</span>`
