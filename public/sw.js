@@ -1,6 +1,6 @@
 // 앱 화면(HTML·JS·CSS)을 캐시해서 무료 서버가 잠들어 있어도 화면은 바로 뜨게 함.
 // 항상 네트워크를 먼저 시도하고, 3초 안에 응답이 없으면 캐시를 보여 줌.
-const CACHE = 'omgyeo-v9';
+const CACHE = 'omgyeo-v10';
 const SHELL = ['/index.html', '/app.js', '/style.css', '/fsutil.js', '/sync.js'];
 
 self.addEventListener('install', e => {

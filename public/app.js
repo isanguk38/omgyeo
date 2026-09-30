@@ -1375,37 +1375,70 @@ async function keepAwake() {
 addEventListener('beforeunload', e => { if (busy()) { e.preventDefault(); e.returnValue = ''; } });
 
 // ---------- 받으면 알림 (다른 창을 보고 있을 때) ----------
-const NOTIFY = { on: store.get('omgyeo.notify', false), unseen: 0 };
-async function announce(title, body) {
-  if (!document.hidden) return;
-  NOTIFY.unseen++;
-  document.title = `(${NOTIFY.unseen}) 옮겨`;
-  if (!NOTIFY.on || !('Notification' in window) || Notification.permission !== 'granted') return;
+// 켜짐 여부는 "사용자가 켰는지" + "브라우저가 실제로 허용했는지"를 함께 봄
+const NOTIFY = { want: store.get('omgyeo.notify', false), unseen: 0 };
+const notifyPerm = () => ('Notification' in window ? Notification.permission : 'unsupported');
+const notifyOn = () => NOTIFY.want && notifyPerm() === 'granted';
+const isEdge = /Edg\//.test(navigator.userAgent);
+async function showNotice(title, body) {
   try {
     // 안드로이드 크롬은 페이지에서 바로 알림을 못 띄워서 서비스 워커를 통해 띄움
     const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
     if (reg) await reg.showNotification(title, { body, tag: 'omgyeo', renotify: true });
     else new Notification(title, { body, tag: 'omgyeo' });
-  } catch {}
+  } catch (err) { console.warn('notify', err); }
+}
+async function announce(title, body) {
+  // 탭이 가려졌거나, 다른 프로그램 창을 보고 있어서 이 창에 포커스가 없을 때만 알림
+  if (!document.hidden && document.hasFocus()) return;
+  if (document.hidden) { NOTIFY.unseen++; document.title = `(${NOTIFY.unseen}) 옮겨`; }
+  if (notifyOn()) showNotice(title, body);
 }
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) { NOTIFY.unseen = 0; document.title = '옮겨'; }
 });
 function renderBell() {
-  const on = NOTIFY.on && 'Notification' in window && Notification.permission === 'granted';
+  const on = notifyOn();
   $('#bellBtn').setAttribute('aria-pressed', String(on));
   $('#bellBtn').title = on ? '알림 켜짐 · 누르면 끔' : '받으면 알림 받기';
+  // 페이지에 들어오면 알림이 꺼져 있을 때 물어봄 ("나중에"를 누르면 7일 동안 묻지 않음)
+  const perm = notifyPerm();
+  const snoozed = Date.now() - Number(store.get('omgyeo.notifyAsked', 0) || 0) < 7 * 864e5;
+  const ask = globalThis.isSecureContext && (perm === 'default' || perm === 'denied') && !on && !snoozed;
+  $('#notifyAsk').hidden = !ask;
+  if (ask) {
+    const blocked = perm === 'denied';
+    $('#notifyAskTitle').textContent = blocked ? '알림이 막혀 있어요' : '파일이나 글이 오면 알려 드릴까요?';
+    $('#notifyAskSub').textContent = blocked ? '브라우저에서 이 사이트의 알림을 차단해 두었어요. 켜는 방법을 알려 드릴게요.'
+      : '다른 창을 보고 있을 때 파일이나 글을 받으면 알림으로 알려 드려요.';
+    $('#notifyYes').textContent = blocked ? '켜는 방법' : '알림 켜기';
+  }
 }
-$('#bellBtn').onclick = async () => {
+const blockedHelp = () => (isEdge
+  ? '알림이 막혀 있어요. 주소창 왼쪽 자물쇠 아이콘 → 이 사이트에 대한 권한 → 알림을 "허용"으로 바꿔 주세요.'
+  : '알림이 막혀 있어요. 주소창 왼쪽 아이콘(조절 버튼) → 알림을 켜 주세요.');
+async function enableNotify() {
   if (!globalThis.isSecureContext) return toast('알림은 https 주소에서만 켤 수 있어요. 배포 주소나 localhost로 열어 주세요.', 4000);
-  if (!('Notification' in window)) return toast('이 브라우저는 알림을 지원하지 않아요. 아이폰은 홈 화면에 추가한 뒤에만 돼요.');
-  if (NOTIFY.on) { NOTIFY.on = false; store.set('omgyeo.notify', false); renderBell(); return toast('알림을 껐어요'); }
+  if (!('Notification' in window)) return toast('이 브라우저는 알림을 지원하지 않아요. 아이폰은 홈 화면에 추가한 뒤에만 돼요.', 4000);
   let perm = Notification.permission;
   if (perm === 'default') perm = await Notification.requestPermission();
-  if (perm !== 'granted') return toast('브라우저에서 알림이 막혀 있어요. 주소창 왼쪽 아이콘을 눌러 알림을 허용하세요.', 4000);
-  NOTIFY.on = true; store.set('omgyeo.notify', true); renderBell();
-  toast('다른 창을 보고 있을 때 받으면 알려 드려요');
+  if (perm === 'granted') {
+    NOTIFY.want = true; store.set('omgyeo.notify', true); renderBell();
+    showNotice('옮겨 알림이 켜졌어요', '다른 창을 보고 있을 때 파일이나 글이 오면 이렇게 알려 드려요.');
+    toast('알림을 켰어요. 방금 뜬 시험 알림이 보이면 정상이에요.', 3500);
+  } else if (perm === 'denied') {
+    renderBell(); toast(blockedHelp(), 6000);
+  } else {
+    // 허용 창을 닫았거나, 브라우저가 조용한 요청(주소창의 작은 종 아이콘)으로 처리한 경우
+    renderBell(); toast('허용 창이 보이지 않으면 주소창 오른쪽의 종 모양 아이콘을 눌러 "허용"을 골라 주세요.', 6000);
+  }
+}
+$('#bellBtn').onclick = () => {
+  if (notifyOn()) { NOTIFY.want = false; store.set('omgyeo.notify', false); renderBell(); return toast('알림을 껐어요'); }
+  enableNotify();
 };
+$('#notifyYes').onclick = () => enableNotify();
+$('#notifyNo').onclick = () => { store.set('omgyeo.notifyAsked', Date.now()); renderBell(); };
 
 // ---------- 사진·영상 크게 보기 ----------
 const V = { list: [], i: 0, x: null };
