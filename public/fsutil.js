@@ -156,15 +156,33 @@ async function scanFolder(root, rules, scope, onProgress) {
     lastTick = now;
     onProgress(d, n, info);
   };
+  // 목록 읽기가 응답 없이 멈추거나 오류가 나는 폴더(클라우드 전용 폴더, 바로 가기 연결 폴더 등)는 그 폴더만 건너뜀
+  const skippedDirs = [];
+  let curDir = '';
   async function walk(dir, prefix) {
-    for await (const [name, h] of dir.entries()) {
-      const path = prefix + name;
-      if (h.kind === 'directory') { if (!isIgnored(rules, path, true)) await walk(h, `${path}/`); }
-      else if (!isIgnored(rules, path, false)) { list.push({ path, handle: h }); tick(false, 0, 0, { phase: 'list', found: list.length }); }
+    curDir = prefix;
+    tick(false, 0, 0, { phase: 'list', found: list.length, dir: prefix });
+    const it = dir.entries();
+    try {
+      for (;;) {
+        const r = await withTimeout(it.next(), READ_STALL);
+        if (r.done) break;
+        const [name, h] = r.value;
+        const path = prefix + name;
+        if (h.kind === 'directory') { if (!isIgnored(rules, path, true)) { await walk(h, `${path}/`); curDir = prefix; } }
+        else if (!isIgnored(rules, path, false)) { list.push({ path, handle: h }); tick(false, 0, 0, { phase: 'list', found: list.length, dir: prefix }); }
+      }
+    } catch (err) {
+      if (!prefix) throw err;   // 고른 폴더 자체를 못 읽으면 실패로 알림
+      console.warn('scan skip dir', prefix, err);
+      skippedDirs.push(prefix);
+      if (it.return) it.return().catch(() => {});
     }
   }
-  tick(true, 0, 0, { phase: 'list', found: 0 });
-  await walk(root, '');
+  tick(true, 0, 0, { phase: 'list', found: 0, dir: '' });
+  // 한 폴더에서 오래 걸려도 지금 어느 폴더를 읽는지 보이도록 1초마다 갱신
+  const listTimer = setInterval(() => tick(true, 0, 0, { phase: 'list', found: list.length, dir: curDir }), 1000);
+  try { await walk(root, ''); } finally { clearInterval(listTimer); }
   const cache = (await idb.get('hash', scope)) || {};
   const next = {};
   const out = new Map();
@@ -202,12 +220,15 @@ async function scanFolder(root, rules, scope, onProgress) {
   tick(true, done, list.length, { phase: 'hash', cur: null });
   if (changed || Object.keys(cache).length !== Object.keys(next).length) await idb.set('hash', scope, next);
   out.skipped = skipped;
+  out.skippedDirs = skippedDirs;
   return out;
 }
+// 이번 훑기에서 읽지 못한 경로인지 (건너뛴 파일 또는 건너뛴 폴더 안)
+const scanSkipped = (out, path) => !!out && ((out.skipped && out.skipped.has(path)) || (out.skippedDirs || []).some(d => path.startsWith(d)));
 // 확인 진행 문구 (scanFolder의 onProgress 값으로)
 function scanText(p, who) {
   if (!p) return `${who} 확인 중…`;
-  if (p.phase === 'list') return `${who}의 파일을 찾는 중 · ${p.found.toLocaleString()}개 찾음`;
+  if (p.phase === 'list') return `${who}의 파일을 찾는 중 · ${p.found.toLocaleString()}개 찾음${p.dir ? ` · ${p.dir.replace(/\/$/, '')}` : ''}`;
   let t = `${who} 확인 중 ${p.d.toLocaleString()} / ${p.n.toLocaleString()}개`;
   if (p.cur) t += ` · 큰 파일 확인 중: ${p.cur.name.split('/').pop()} ${Math.floor((p.cur.done / p.cur.size) * 100)}%`;
   return t;

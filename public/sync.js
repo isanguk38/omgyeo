@@ -136,8 +136,11 @@ async function scanShare(opts = {}) {
     Sync.local = await scanFolder(Sync.share.handle, Sync.rules, `share:${Sync.share.id}`, (d, n, info) => {
       if (first || opts.progress) { Sync.scanProg = { d, n, ...info }; if (first) Sync.scanMsg = scanText(Sync.scanProg, '폴더'); syncRender(); }
     });
-    const sk = Sync.local.skipped.size;
-    Sync.scanMsg = sk ? `읽지 못한 파일 ${sk.toLocaleString()}개는 건너뛰었어요. 인터넷에만 있는 클라우드 파일(OneDrive 등)이거나 다른 프로그램이 쓰고 있는 파일일 수 있어요.` : '';
+    const sk = Sync.local.skipped.size, sd = Sync.local.skippedDirs;
+    const skipParts = [];
+    if (sd.length) skipParts.push(`읽지 못한 폴더 ${sd.length}개(${sd.slice(0, 3).map(d => d.replace(/\/$/, '')).join(', ')}${sd.length > 3 ? ' 등' : ''})`);
+    if (sk) skipParts.push(`파일 ${sk.toLocaleString()}개`);
+    Sync.scanMsg = skipParts.length ? `${skipParts.join('와 ')}는 건너뛰었어요. 인터넷에만 있는 클라우드 파일(OneDrive 등), 바로 가기로 연결된 폴더, 다른 프로그램이 쓰는 파일일 수 있어요. 제외 규칙에 넣으면 다음부터 건너뛰어요.` : '';
     Sync.localAt = Date.now();
   } catch (err) {
     console.warn('scan', err);
@@ -203,7 +206,7 @@ function diff(sess) {
     if (!r || r[1] !== e.hash) { send.push(path); bytes += e.size; status.set(path, r ? 'M' : 'A'); }
   }
   const extra = [];
-  for (const path of sess.remote.keys()) if (!Sync.local.has(path) && !(Sync.local.skipped && Sync.local.skipped.has(path))) extra.push(path);   // 읽지 못한 파일은 지울 대상으로 보지 않음
+  for (const path of sess.remote.keys()) if (!Sync.local.has(path) && !scanSkipped(Sync.local, path)) extra.push(path);   // 읽지 못한 파일은 지울 대상으로 보지 않음
   send.sort();
   sess.diff = { send, bytes, extra, status };
 }
