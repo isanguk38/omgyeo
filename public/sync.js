@@ -133,10 +133,11 @@ async function scanShare(opts = {}) {
   const t0 = performance.now();
   const first = !Sync.local;
   try {
-    Sync.local = await scanFolder(Sync.share.handle, Sync.rules, `share:${Sync.share.id}`, (d, n) => {
-      if (first || opts.progress) { Sync.scanProg = { d, n }; if (first) Sync.scanMsg = `파일 확인 중 ${d.toLocaleString()} / ${n.toLocaleString()}`; syncRender(); }
+    Sync.local = await scanFolder(Sync.share.handle, Sync.rules, `share:${Sync.share.id}`, (d, n, info) => {
+      if (first || opts.progress) { Sync.scanProg = { d, n, ...info }; if (first) Sync.scanMsg = scanText(Sync.scanProg, '폴더'); syncRender(); }
     });
-    Sync.scanMsg = '';
+    const sk = Sync.local.skipped.size;
+    Sync.scanMsg = sk ? `읽지 못한 파일 ${sk.toLocaleString()}개는 건너뛰었어요. 인터넷에만 있는 클라우드 파일(OneDrive 등)이거나 다른 프로그램이 쓰고 있는 파일일 수 있어요.` : '';
     Sync.localAt = Date.now();
   } catch (err) {
     console.warn('scan', err);
@@ -202,7 +203,7 @@ function diff(sess) {
     if (!r || r[1] !== e.hash) { send.push(path); bytes += e.size; status.set(path, r ? 'M' : 'A'); }
   }
   const extra = [];
-  for (const path of sess.remote.keys()) if (!Sync.local.has(path)) extra.push(path);
+  for (const path of sess.remote.keys()) if (!Sync.local.has(path) && !(Sync.local.skipped && Sync.local.skipped.has(path))) extra.push(path);   // 읽지 못한 파일은 지울 대상으로 보지 않음
   send.sort();
   sess.diff = { send, bytes, extra, status };
 }
@@ -514,8 +515,8 @@ async function inIndex(s, force) {
   if (!force && Date.now() - (s.lastWrite || 0) < 10000) return;   // 받은 직후에는 폴더 재검사를 잠시 쉼
   s.indexing = true;
   let lastSent = 0;
-  const progress = (d, n) => {   // 상대에게 진행률 알리기 (0.4초에 한 번)
-    s.scanProg = { d, n };
+  const progress = (d, n, info) => {   // 상대에게 진행률 알리기 (0.4초에 한 번)
+    s.scanProg = { d, n, ...info };
     const now = Date.now();
     if (force && now - lastSent > 400) { lastSent = now; sendCtrl(p, { t: 'sync-scan', sid: s.sid, done: d, total: n }).catch(() => {}); }
     if (force) syncRender();
@@ -969,7 +970,7 @@ function drawSync() {
     const st = recvActive(s) && ['ready', 'receiving'].includes(s.state) ? recvProgress(s) : {
       ask: `<b>${esc(s.peerName)}</b>이(가) <b>'${esc(s.name)}'</b> 폴더를 보내려고 해요. 고른 위치 안에 '${esc(s.name)}' 폴더를 만들어 받아요.`,
       perm: `전에 고른 받을 폴더 <b>'${esc(s.name)}'</b>는 그대로 기억하고 있어요. 브라우저 보안 때문에 새로고침하거나 브라우저를 다시 열면 [폴더 접근 허용]을 한 번 더 눌러야 해요. 크롬 창에서 <b>'방문할 때마다 허용'</b>을 고르면 다음부터는 묻지 않아요.`,
-      ready: s.scanProg ? `<span class="busy">받는 폴더 확인 중 ${s.scanProg.d.toLocaleString()} / ${s.scanProg.n.toLocaleString()}개</span>`
+      ready: s.scanProg ? `<span class="busy">${esc(scanText(s.scanProg, '받는 폴더'))}</span>`
         : `<span class="ok">✓ 연결됨</span> · ${esc(s.peerName)}에서 받는 중${s.fileCount != null ? ` · 폴더 파일 ${s.fileCount.toLocaleString()}개` : ''} · 받은 파일 ${s.count}개${s.last ? ` · 마지막 적용 ${ago(s.last)}` : ''}`,
       receiving: `<span class="busy">변경 적용 중…</span> · 받은 파일 ${s.count}개`,
       away: '연결 끊김 · 다시 연결되면 이어서 받아요',
@@ -1063,7 +1064,7 @@ function syncAskCards() {
 }
 // 확인 단계 문구: 내 폴더 훑기 → 상대 폴더 훑기 → (상대가 받는 중이면) 대기
 function checkPhase(sess) {
-  if (Sync.scanProg && (sess.checking || !Sync.local)) return `내 폴더 확인 중 ${Sync.scanProg.d.toLocaleString()} / ${Sync.scanProg.n.toLocaleString()}개`;
+  if (Sync.scanProg && (sess.checking || !Sync.local)) return esc(scanText(Sync.scanProg, '내 폴더'));
   if (sess.busy) return '상대 PC가 파일을 받는 중이에요. 끝나면 바로 비교해요';
   if (sess.remoteScan) return sess.remoteScan.n ? `상대 PC가 폴더를 확인하는 중 ${sess.remoteScan.d.toLocaleString()} / ${sess.remoteScan.n.toLocaleString()}개` : '상대 PC가 폴더를 확인하는 중…';
   return null;
@@ -1121,7 +1122,9 @@ function peerRow(sess) {
       + `<span class="pr-bar" role="progressbar" aria-valuenow="${Math.round(pct)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct.toFixed(1)}%"></i></span>`
       + (now ? `<small class="pr-now">${now}</small>` : '');
   } else if (sess.state === 'ready' && !sess.remote) st = '<span class="busy"><span class="spin"></span>상대 PC의 폴더 목록을 기다리는 중</span>';
-  else if (sess.state === 'ready' && !Sync.local) st = `<span class="busy"><span class="spin"></span>${Sync.scanProg ? `내 폴더 확인 중 ${Sync.scanProg.d.toLocaleString()} / ${Sync.scanProg.n.toLocaleString()}개` : '내 폴더 확인 중…'}</span>`;   // 규칙을 바꾼 직후 등 내 목록을 다시 만드는 중
+  else if (sess.state === 'ready' && !Sync.local) st = Sync.scanning || !Sync.scanMsg   // 규칙을 바꾼 직후 등 내 목록을 다시 만드는 중
+    ? `<span class="busy"><span class="spin"></span>${esc(scanText(Sync.scanProg, '내 폴더'))}</span>`
+    : `${esc(Sync.scanMsg)} 잠시 뒤 다시 확인해요.`;   // 훑다가 실패하면 계속 도는 표시 대신 이유를 보여 줌
   else if (sess.state === 'ready' && d) {
     const parts = [];
     if (d.send.length) parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개 · ${fmtSize(d.bytes)} · ${fmtDuration(estimate(sess, d.bytes, d.send.length))}`);

@@ -126,11 +126,18 @@ function isIgnored(rules, path, isDir) {
 const HASH_WHOLE = 16 * 1024 * 1024;   // 이보다 작으면 통째로
 const HASH_BLOCK = 8 * 1024 * 1024;    // 크면 8MB 블록 해시들을 다시 해시
 const hex = buf => Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
-async function hashFile(file) {
-  if (file.size <= HASH_WHOLE) return hex(await crypto.subtle.digest('SHA-256', await file.arrayBuffer())).slice(0, 32);
+// 읽기가 응답 없이 멈추는 파일(클라우드 전용 파일, 다른 프로그램이 잠근 파일 등)은 기다리다 건너뜀
+const READ_STALL = 30000;
+function withTimeout(promise, ms) {
+  let t;
+  return Promise.race([promise, new Promise((_, no) => { t = setTimeout(() => no(new Error('read-stall')), ms); })]).finally(() => clearTimeout(t));
+}
+async function hashFile(file, onBytes) {
+  if (file.size <= HASH_WHOLE) return hex(await crypto.subtle.digest('SHA-256', await withTimeout(file.arrayBuffer(), READ_STALL))).slice(0, 32);
   const parts = [];
   for (let off = 0; off < file.size; off += HASH_BLOCK) {
-    parts.push(new Uint8Array(await crypto.subtle.digest('SHA-256', await file.slice(off, off + HASH_BLOCK).arrayBuffer())));
+    parts.push(new Uint8Array(await crypto.subtle.digest('SHA-256', await withTimeout(file.slice(off, off + HASH_BLOCK).arrayBuffer(), READ_STALL))));
+    if (onBytes) onBytes(Math.min(file.size, off + HASH_BLOCK));
   }
   const all = new Uint8Array(parts.length * 32);
   parts.forEach((p, i) => all.set(p, i * 32));
@@ -138,38 +145,72 @@ async function hashFile(file) {
 }
 
 // ---------- 폴더 훑기 ----------
-// 결과: Map(path -> { size, mtime, hash, handle })
+// 결과: Map(path -> { size, mtime, hash, handle }), out.skipped = 읽지 못해 건너뛴 경로(Set)
+// onProgress(done, total, info): info.phase = 'list'(파일 찾는 중, info.found) | 'hash'(info.cur = 지금 확인 중인 큰 파일 {name, done, size})
 async function scanFolder(root, rules, scope, onProgress) {
   const list = [];
+  let lastTick = 0;
+  const tick = (force, d, n, info) => {   // 화면 갱신은 0.25초에 한 번
+    const now = Date.now();
+    if (!onProgress || (!force && now - lastTick < 250)) return;
+    lastTick = now;
+    onProgress(d, n, info);
+  };
   async function walk(dir, prefix) {
     for await (const [name, h] of dir.entries()) {
       const path = prefix + name;
       if (h.kind === 'directory') { if (!isIgnored(rules, path, true)) await walk(h, `${path}/`); }
-      else if (!isIgnored(rules, path, false)) list.push({ path, handle: h });
+      else if (!isIgnored(rules, path, false)) { list.push({ path, handle: h }); tick(false, 0, 0, { phase: 'list', found: list.length }); }
     }
   }
+  tick(true, 0, 0, { phase: 'list', found: 0 });
   await walk(root, '');
   const cache = (await idb.get('hash', scope)) || {};
   const next = {};
   const out = new Map();
-  let changed = false, done = 0;
+  const skipped = new Set();
+  let changed = false, done = 0, big = null;
   const BATCH = 24;
   for (let i = 0; i < list.length; i += BATCH) {
     await Promise.all(list.slice(i, i + BATCH).map(async ({ path, handle }) => {
-      let file;
-      try { file = await handle.getFile(); } catch { return; }   // 훑는 사이 지워진 파일
       const c = cache[path];
-      let hash;
-      if (c && c[0] === file.size && c[1] === file.lastModified) hash = c[2];
-      else { hash = await hashFile(file); changed = true; }
-      next[path] = [file.size, file.lastModified, hash];
-      out.set(path, { size: file.size, mtime: file.lastModified, hash, handle });
+      try {
+        let file;
+        try { file = await withTimeout(handle.getFile(), READ_STALL); } catch (e) { if (e.message === 'read-stall') throw e; return; }   // 훑는 사이 지워진 파일
+        let hash;
+        if (c && c[0] === file.size && c[1] === file.lastModified) hash = c[2];
+        else {
+          const cur = file.size > HASH_WHOLE ? { name: path, done: 0, size: file.size } : null;
+          if (cur) big = cur;
+          hash = await hashFile(file, cur && (b => { cur.done = b; tick(false, done, list.length, { phase: 'hash', cur }); }));
+          if (big === cur) big = null;
+          changed = true;
+        }
+        next[path] = [file.size, file.lastModified, hash];
+        out.set(path, { size: file.size, mtime: file.lastModified, hash, handle });
+      } catch (err) {
+        // 읽기가 멈춘 파일: 전에 확인한 값이 있으면 그대로 쓰고, 없으면 이번에는 건너뜀
+        console.warn('scan skip', path, err);
+        skipped.add(path);
+        if (c) next[path] = c;
+      } finally {
+        done++;
+        tick(false, done, list.length, { phase: 'hash', cur: big });
+      }
     }));
-    done += Math.min(BATCH, list.length - i);
-    if (onProgress) onProgress(done, list.length);
   }
+  tick(true, done, list.length, { phase: 'hash', cur: null });
   if (changed || Object.keys(cache).length !== Object.keys(next).length) await idb.set('hash', scope, next);
+  out.skipped = skipped;
   return out;
+}
+// 확인 진행 문구 (scanFolder의 onProgress 값으로)
+function scanText(p, who) {
+  if (!p) return `${who} 확인 중…`;
+  if (p.phase === 'list') return `${who}의 파일을 찾는 중 · ${p.found.toLocaleString()}개 찾음`;
+  let t = `${who} 확인 중 ${p.d.toLocaleString()} / ${p.n.toLocaleString()}개`;
+  if (p.cur) t += ` · 큰 파일 확인 중: ${p.cur.name.split('/').pop()} ${Math.floor((p.cur.done / p.cur.size) * 100)}%`;
+  return t;
 }
 // 받은 파일을 썼을 때 캐시에 바로 반영 (다시 해시하지 않도록)
 async function rememberHash(scope, path, file, hash) {
