@@ -248,6 +248,11 @@ body.noscroll{overflow:hidden}
 .cl-path{font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
 .cl-size,.cl-lines{font-family:var(--mono);color:var(--muted);white-space:nowrap}
 .cl-more{padding:6px 12px;font-size:12px;color:var(--muted)}
+.changes .cl-row{grid-template-columns:18px minmax(0,1fr) auto auto auto}
+.cl-who{font-size:11px;font-weight:700;white-space:nowrap;color:var(--muted)}
+.cl-who.who-them,.cl-who.who-both{color:var(--bad)}
+.cl-sum-who{margin-left:auto;font-weight:600;color:var(--muted)}
+.cl-warn{padding:8px 12px;font-size:12px;color:var(--bad);border-bottom:1px solid var(--line)}
 
 dialog.wide{width:min(920px,calc(100% - 32px));max-height:calc(100% - 48px);padding:0;display:none;flex-direction:column}
 dialog.wide[open]{display:flex}
