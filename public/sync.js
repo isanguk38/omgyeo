@@ -1,14 +1,15 @@
 'use strict';
 /* PC 간 폴더 동기화 (한 방향: 공유하는 PC → 받는 PC)
  * 1) 공유하는 쪽이 폴더를 고르고, 연결된 PC 중 하나를 직접 골라 공유를 요청합니다.
- * 2) 받는 쪽이 받을 위치를 고르면(또는 전에 고른 위치가 있고 권한이 있으면) 자기 폴더 목록과 해시를 보냅니다.
- * 3) 공유하는 쪽은 몇 초마다 폴더를 훑어 해시를 비교하고, 다른 파일이 있으면 "공유하기"를 켭니다.
+ * 2) 받는 쪽이 받을 위치를 고르면(또는 전에 고른 위치가 있고 권한이 있으면) 자기 폴더 목록과 해시를 한 번 보냅니다.
+ *    이후 받는 쪽은 공유 요청·동기화 확인 때만 목록을 보내고, 받는 쪽에서 고친 내용은 알리지 않습니다.
+ * 3) 공유하는 쪽은 몇 초마다 폴더를 훑어 "기기별로 마지막에 보낸 해시(기준)"와 비교하고, 내가 고친 파일이 있으면 "공유하기"를 켭니다.
+ *    기준이 없는 파일(첫 연결)만 상대 폴더와 직접 비교해서, 같으면 그 해시를 기준으로 삼습니다.
  * 4) 공유하기를 누르면 바뀐 파일만 기다림 없이 연달아 보내고, 받는 쪽은 디스크에 바로 씁니다.
  * 두 PC의 짝은 기기 고유 id(pid)로 기억해서 다음 연결 때 다시 고르지 않아도 됩니다.
  */
 const SYNC_WINDOW = 24 * 1024 * 1024;   // 받는 쪽 확인이 안 된 전송량 한도 (메모리 폭주 방지)
 const SYNC_INDEX_PART = 1500;           // 목록을 나눠 보내는 단위
-const SYNC_RESCAN_RECV = 8000;          // 받는 쪽 폴더 재확인 주기
 const SYNC_STALL = 30000;               // 받는 쪽 응답이 이만큼 없으면 멈춘 것으로 보고 다시 시도
 const SYNC_RETRY = 3;                   // 자동 재시도 횟수
 const SYNC_EXTRA_IGNORE = '*.crswap';   // 크롬이 쓰는 중에 만드는 임시 파일
@@ -43,7 +44,7 @@ Sync.setRoom = async room => {
   if (!FS_OK || Sync.room === room) return;
   for (const sess of Sync.sessions.values()) cancelPush(sess);
   Sync.sessions.clear();
-  for (const s of Sync.inbound.values()) { clearInterval(s.timer); flushCache(s); }
+  for (const s of Sync.inbound.values()) flushCache(s);
   for (const u of Sync.fidMap.values()) abortUnit(u);
   Sync.fidMap.clear(); Sync.inbound.clear();
   Object.assign(Sync, { room, share: null, shareOk: false, local: null, ignoreDraft: null, scanMsg: '' });
@@ -111,6 +112,7 @@ async function grantShare() {
 }
 function cancelPush(sess) { sess.cancelled = true; wakeAll(sess); }
 function stopAll() {
+  for (const pid of Sync.share.targets) dropBase(pid);
   for (const sess of Sync.sessions.values()) {
     cancelPush(sess);
     const p = S.peers.get(sess.peerId);
@@ -175,7 +177,10 @@ function offer(p) {
     Sync.sessions.set(pid, sess);
   }
   Object.assign(sess, { peerId: p.id, name: p.name, state: 'offer', remote: null, parts: [], remoteScan: null, busy: false });
-  sendCtrl(p, { t: 'sync-offer', sid: Sync.share.id, name: Sync.share.name, rules: Sync.ruleText }).catch(() => {});
+  loadBase(sess).then(() => {   // 상대 목록이 오기 전에 기준을 먼저 읽어 둠
+    if (!Sync.share || Sync.sessions.get(pid) !== sess) return;
+    sendCtrl(p, { t: 'sync-offer', sid: Sync.share.id, name: Sync.share.name, rules: Sync.ruleText }).catch(() => {});
+  });
   scanLoop();
   syncRender();
 }
@@ -191,27 +196,53 @@ async function stopWith(pid) {
   const p = sess && S.peers.get(sess.peerId);
   if (sess) { cancelPush(sess); markResume(sess, false); }   // 진행 중인 전송을 즉시 멈춤 (남은 파일을 헛되이 보내지 않도록)
   if (p) sendCtrl(p, { t: 'sync-stop', sid: Sync.share.id }).catch(() => {});
+  dropBase(pid);   // 다시 공유하면 상대 폴더와 처음부터 비교
   Sync.sessions.delete(pid);
   Sync.share.targets = Sync.share.targets.filter(x => x !== pid);
   await saveShare();
   syncRender();
 }
+// 기준(base): 이 기기에 마지막으로 보낸(또는 처음에 같다고 확인한) 파일의 해시. Map(path -> hash)
+// 내 파일을 기준과 비교하므로, 상대가 자기 폴더에서 고친 내용은 변경으로 잡히지 않음
+const baseKey = pid => `base:${Sync.share.id}:${pid}`;
+function loadBase(sess) {
+  sess.baseKey = baseKey(sess.pid);
+  return sess.baseLoad || (sess.baseLoad = idb.get('kv', sess.baseKey).then(m => { sess.base = m instanceof Map ? m : new Map(); }));
+}
+function saveBase(sess) {
+  clearTimeout(sess.baseTimer);
+  sess.baseTimer = setTimeout(() => idb.set('kv', sess.baseKey, sess.base), 1000);
+}
+function dropBase(pid) {
+  const sess = Sync.sessions.get(pid);
+  if (sess) clearTimeout(sess.baseTimer);
+  idb.del('kv', baseKey(pid));
+}
 function diff(sess) {
-  if (!Sync.local || !sess.remote) return;
+  if (!Sync.local || !sess.remote || !sess.base) return;
+  const base = sess.base;
   const send = [];
   const status = new Map();
-  let bytes = 0;
+  let bytes = 0, dirty = false;
   for (const [path, e] of Sync.local) {
-    const r = sess.remote.get(path);
-    if (!r || r[1] !== e.hash) { send.push(path); bytes += e.size; status.set(path, r ? 'M' : 'A'); }
+    const b = base.get(path), r = sess.remote.get(path);
+    if (b === e.hash) continue;   // 내가 고치지 않은 파일 (상대가 고쳤어도 무시)
+    if (r && r[1] === e.hash) { base.set(path, e.hash); dirty = true; continue; }   // 이미 같은 내용
+    send.push(path); bytes += e.size; status.set(path, b != null || r ? 'M' : 'A');
   }
+  // 지울 대상: 전에 보낸 적이 있는데 내 쪽에서 지운 파일 (상대 쪽에만 있는 파일은 건드리지 않음)
   const extra = [];
-  for (const path of sess.remote.keys()) if (!Sync.local.has(path) && !scanSkipped(Sync.local, path)) extra.push(path);   // 읽지 못한 파일은 지울 대상으로 보지 않음
+  for (const path of base.keys()) {
+    if (Sync.local.has(path) || scanSkipped(Sync.local, path)) continue;   // 읽지 못한 파일은 지울 대상으로 보지 않음
+    if (sess.remote.has(path)) extra.push(path);
+    else { base.delete(path); dirty = true; }
+  }
+  if (dirty) saveBase(sess);
   send.sort();
   sess.diff = { send, bytes, extra, status };
 }
 const hasWork = sess => sess.diff && (sess.diff.send.length || (Sync.share.mirror && sess.diff.extra.length));
-// 동기화 확인: 내 폴더와 상대 폴더를 지금 다시 훑어서 비교
+// 동기화 확인: 내 폴더를 지금 다시 훑어서 보낼 변경을 찾음
 async function checkNow(sess) {
   const p = S.peers.get(sess.peerId);
   if (!p || sess.state === 'syncing' || sess.checking) return;
@@ -235,8 +266,8 @@ function finishCheck(sess) {
   const d = sess.diff;
   if (!d) return;
   const n = Sync.local ? Sync.local.size : 0;
-  if (!d.send.length && !(Sync.share.mirror && d.extra.length)) toast(`동기화 확인 완료 · 파일 ${n.toLocaleString()}개 모두 같아요`, 4000);
-  else toast(`동기화 확인 완료 · 다른 파일 ${d.send.length.toLocaleString()}개가 있어요. 공유하기로 맞출 수 있어요.`, 5000);
+  if (!d.send.length && !(Sync.share.mirror && d.extra.length)) toast(`동기화 확인 완료 · 보낼 변경이 없어요 (내 파일 ${n.toLocaleString()}개)`, 4000);
+  else toast(`동기화 확인 완료 · 보낼 변경 ${d.send.length.toLocaleString()}개가 있어요. 공유하기로 보낼 수 있어요.`, 5000);
 }
 function autoPush(sess) { if (Sync.share.auto && sess.state === 'ready' && hasWork(sess)) push(sess); }
 
@@ -443,6 +474,7 @@ function onAckItem(sess, it, ok) {
   sess.lastAck = Date.now();
   if (sess.prog) sess.prog.lastMove = Date.now();
   if (ok && sess.remote) sess.remote.set(it.path, [it.size, it.hash]);
+  if (ok && sess.base) { sess.base.set(it.path, it.hash); saveBase(sess); }
   if (ok && sess.prog) {
     sess.prog.files.push([it.path, it.st || sess.prog.status.get(it.path) || 'M', it.size, it.adds ?? null, it.dels ?? null]);
     if (it.diff) sess.prog.diffs[it.path] = it.diff;
@@ -469,7 +501,7 @@ async function inOffer(p, m) {
   let s = Sync.inbound.get(sid);
   if (!s) {
     const saved = await idb.get('kv', `recv:${sid}`);
-    s = { sid, handle: saved ? saved.handle : null, count: 0, applied: 0, last: null, sig: '', timer: null, receiving: 0, cache: null, cacheTimer: null };
+    s = { sid, handle: saved ? saved.handle : null, count: 0, applied: 0, last: null, receiving: 0, cache: null, cacheTimer: null };
     Sync.inbound.set(sid, s);
   }
   Object.assign(s, { peerId: p.id, peerName: p.name, name: cleanName(m.name), rules });
@@ -499,44 +531,37 @@ async function inAllow(sid) {
 }
 async function inReady(s) {
   s.state = 'ready';
-  s.sig = null;   // 빈 폴더(요약값 '')도 처음 한 번은 꼭 보내도록
   syncRender();
-  await inIndex(s, true);
-  clearInterval(s.timer);
-  s.timer = setInterval(() => inIndex(s), SYNC_RESCAN_RECV);   // 이쪽에서 고친 파일도 알려 줌
+  await inIndex(s);
 }
-// force: 확인 요청·새 공유 요청 → 바뀐 게 없어도 목록을 보내고, 받는 중이면 끝난 뒤에 바로 보냄
-async function inIndex(s, force) {
+// 내 폴더 목록을 보냄. 공유 요청·동기화 확인 때만 (이쪽에서 고친 파일을 따로 알리지 않음). 받는 중이면 끝난 뒤에 바로 보냄
+async function inIndex(s) {
   const p = S.peers.get(s.peerId);
   if (!p) return;
-  if (s.indexing) { if (force) s.checkPending = true; return; }
+  if (s.indexing) { s.checkPending = true; return; }
   if (s.receiving || s.state === 'receiving') {
-    if (force) { s.checkPending = true; sendCtrl(p, { t: 'sync-busy', sid: s.sid }).catch(() => {}); }
+    s.checkPending = true;
+    sendCtrl(p, { t: 'sync-busy', sid: s.sid }).catch(() => {});
     return;
   }
   if (s.state !== 'ready') return;
-  if (!force && Date.now() - (s.lastWrite || 0) < 10000) return;   // 받은 직후에는 폴더 재검사를 잠시 쉼
   s.indexing = true;
   let lastSent = 0;
   const progress = (d, n, info) => {   // 상대에게 진행률 알리기 (0.4초에 한 번)
     s.scanProg = { d, n, ...info };
     const now = Date.now();
-    if (force && now - lastSent > 400) { lastSent = now; sendCtrl(p, { t: 'sync-scan', sid: s.sid, done: d, total: n }).catch(() => {}); }
-    if (force) syncRender();
+    if (now - lastSent > 400) { lastSent = now; sendCtrl(p, { t: 'sync-scan', sid: s.sid, done: d, total: n }).catch(() => {}); }
+    syncRender();
   };
-  if (force) sendCtrl(p, { t: 'sync-scan', sid: s.sid, done: 0, total: 0 }).catch(() => {});
+  sendCtrl(p, { t: 'sync-scan', sid: s.sid, done: 0, total: 0 }).catch(() => {});
   try {
     await flushCache(s);
     const idx = await scanFolder(s.handle, s.rules, `recv:${s.sid}`, progress);
     const entries = [...idx].map(([path, e]) => [path, e.size, e.hash]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
-    const sig = entries.map(e => `${e[0]}|${e[2]}`).join('\n');
     s.fileCount = entries.length;
-    if (force || sig !== s.sig) {
-      s.sig = sig;
-      if (!entries.length) await sendCtrl(p, { t: 'sync-index', sid: s.sid, first: true, last: true, files: [] });
-      for (let i = 0; i < entries.length; i += SYNC_INDEX_PART) {
-        await sendCtrl(p, { t: 'sync-index', sid: s.sid, first: i === 0, last: i + SYNC_INDEX_PART >= entries.length, files: entries.slice(i, i + SYNC_INDEX_PART) });
-      }
+    if (!entries.length) await sendCtrl(p, { t: 'sync-index', sid: s.sid, first: true, last: true, files: [] });
+    for (let i = 0; i < entries.length; i += SYNC_INDEX_PART) {
+      await sendCtrl(p, { t: 'sync-index', sid: s.sid, first: i === 0, last: i + SYNC_INDEX_PART >= entries.length, files: entries.slice(i, i + SYNC_INDEX_PART) });
     }
   } catch (err) {
     console.warn('index', err);
@@ -544,7 +569,7 @@ async function inIndex(s, force) {
   } finally {
     s.indexing = false; s.scanProg = null; s.indexedAt = Date.now();
     syncRender();
-    if (s.checkPending && !s.receiving) { s.checkPending = false; setTimeout(() => inIndex(s, true), 300); }
+    if (s.checkPending && !s.receiving) { s.checkPending = false; setTimeout(() => inIndex(s), 300); }
   }
 }
 // 받는 단위(unit): 큰 파일 하나(single) 또는 작은 파일 묶음(batch). 압축돼 오면 받으면서 풀어서 씀
@@ -556,7 +581,6 @@ function abortUnit(u) {
 async function openRecv(s, rawPath, size, hash) {
   const path = safePath(rawPath);
   if (!path || isIgnored(s.rules, path, false)) throw new Error('bad path');
-  s.lastWrite = Date.now();
   for (const [key, old] of Sync.fidMap) {   // 멈췄다가 다시 보내는 경우: 같은 파일을 쓰던 단위를 정리
     if (old.s === s && ((old.st && old.st.path === path) || (old.cur && old.cur.path === path))) {
       Sync.fidMap.delete(key); abortUnit(old); unitDone(s);
@@ -652,7 +676,7 @@ function unitDone(s) {
   s.receiving = Math.max(0, s.receiving - 1);
   if (s.receiving) return;
   s.state = 'ready';
-  if (s.checkPending) { s.checkPending = false; setTimeout(() => inIndex(s, true), 1200); }   // 받는 동안 온 확인 요청
+  if (s.checkPending) { s.checkPending = false; setTimeout(() => inIndex(s), 1200); }   // 받는 동안 온 확인 요청
   clearTimeout(s.doneTimer);
   s.doneTimer = setTimeout(() => {
     saveBatch(s);
@@ -680,7 +704,7 @@ async function inFile(p, m) {
   const u = { kind: 'single', s, p, st, got: 0, total: st.size, z: m.z === 'gzip', failed: false };
   u.sink = async bytes => {
     if (u.failed) return;
-    try { await st.w.write(bytes); s.lastWrite = Date.now(); } catch (err) { u.failed = true; st.w.abort().catch(() => {}); }
+    try { await st.w.write(bytes); } catch (err) { u.failed = true; st.w.abort().catch(() => {}); }
   };
   u.finish = async () => {
     if (u.failed) return sendAcks(p, s.sid, [], [st.raw]);
@@ -736,7 +760,6 @@ async function inBatch(p, m) {
         u.flushAcks();
       }
     }
-    s.lastWrite = Date.now();
   };
   // 묶음(최대 200개)을 다 쓸 때까지 기다리지 않고 1.5초마다 저장한 파일을 알려서, 보내는 쪽 개수가 꾸준히 올라가게 함
   u.ackAt = Date.now();
@@ -807,25 +830,26 @@ async function flushCache(s) {
 async function inDel(p, m) {
   const s = Sync.inbound.get(m.sid);
   if (!s || !['ready', 'receiving'].includes(s.state)) return;
-  const removed = [];
+  const removed = [], gone = [];
   for (const raw of (m.paths || []).slice(0, 100000)) {
     const path = safePath(raw);
     if (!path || isIgnored(s.rules, path, false)) continue;
-    try { await removeAt(s.handle, path); removed.push(raw); } catch {}
+    try { await removeAt(s.handle, path); removed.push(raw); }
+    catch (err) { if (err.name === 'NotFoundError') gone.push(raw); }   // 이쪽에서 이미 지운 파일
   }
   if (removed.length) {
+    if (s.fileCount != null) s.fileCount = Math.max(0, s.fileCount - removed.length);
     toast(`'${s.name}'에서 ${removed.length}개를 지웠어요 (보낸 쪽에서 지운 파일)`);
     if (!s.batch) s.batch = { files: [], diffs: {} };
     for (const path of removed) s.batch.files.push([path, 'D', 0, null, null]);
     clearTimeout(s.doneTimer);
     s.doneTimer = setTimeout(() => saveBatch(s), 1500);
   }
-  sendCtrl(p, { t: 'sync-deleted', sid: m.sid, paths: removed }).catch(() => {});
+  sendCtrl(p, { t: 'sync-deleted', sid: m.sid, paths: [...removed, ...gone] }).catch(() => {});
 }
 function inStop(sid, notify) {
   const s = Sync.inbound.get(sid);
   if (!s) return;
-  clearInterval(s.timer);
   for (const [key, u] of Sync.fidMap) if (u.s === s) { Sync.fidMap.delete(key); abortUnit(u); }
   flushCache(s);
   Sync.inbound.delete(sid);
@@ -848,7 +872,7 @@ Sync.onCtrl = async (p, m) => {
   switch (m.t) {
     // 받는 쪽
     case 'sync-offer': return inOffer(p, m);
-    case 'sync-check': { const s2 = Sync.inbound.get(m.sid); if (s2 && s2.peerId === p.id) inIndex(s2, true); return; }
+    case 'sync-check': { const s2 = Sync.inbound.get(m.sid); if (s2 && s2.peerId === p.id) inIndex(s2); return; }
     case 'sync-plan': {   // 보내는 쪽이 이번에 보낼 개수·용량
       const s2 = Sync.inbound.get(m.sid);
       if (s2 && s2.peerId === p.id) { s2.plan = { total: Math.max(0, Number(m.total) || 0), bytes: Math.max(0, Number(m.bytes) || 0), done: 0, saved: 0, at: Date.now(), hist: [], last: '' }; recvTicker(s2); syncRender(); }
@@ -876,7 +900,7 @@ Sync.onCtrl = async (p, m) => {
       if (m.last) {
         sess.remote = new Map(sess.parts.map(([path, size, hash]) => [path, [size, hash]]));
         sess.parts = [];
-        sess.remoteScan = null; sess.busy = false; sess.remoteAt = Date.now();
+        sess.remoteScan = null; sess.busy = false;
         if (sess.state !== 'syncing') sess.state = 'ready';
         diff(sess);
         finishCheck(sess);
@@ -904,6 +928,7 @@ Sync.onCtrl = async (p, m) => {
     case 'sync-err': {
       if (!mine) return;
       if (m.t === 'sync-ack' && sess.remote) sess.remote.set(m.path, [m.size, m.hash]);
+      if (m.t === 'sync-ack' && sess.base) { sess.base.set(m.path, m.hash); saveBase(sess); }
       if (m.t === 'sync-ack' && sess.prog) {
         sess.prog.files.push([m.path, m.st || sess.prog.status.get(m.path) || 'M', m.size, m.adds ?? null, m.dels ?? null]);
         if (m.diff) sess.prog.diffs[m.path] = m.diff;
@@ -918,7 +943,8 @@ Sync.onCtrl = async (p, m) => {
     }
     case 'sync-deleted':
       if (mine && sess.remote) {
-        for (const path of m.paths || []) { sess.remote.delete(path); if (sess.prog) sess.prog.files.push([path, 'D', 0, null, null]); }
+        for (const path of m.paths || []) { sess.remote.delete(path); if (sess.base) sess.base.delete(path); if (sess.prog) sess.prog.files.push([path, 'D', 0, null, null]); }
+        if (sess.base) saveBase(sess);
         diff(sess); syncRender();
       }
       return;
@@ -950,7 +976,7 @@ Sync.onPeerLeft = p => {
     Sync.fidMap.delete(key);
     u.s.receiving = Math.max(0, u.s.receiving - 1);
   }
-  for (const s of Sync.inbound.values()) if (s.peerId === p.id) { s.state = 'away'; clearInterval(s.timer); flushCache(s); }
+  for (const s of Sync.inbound.values()) if (s.peerId === p.id) { s.state = 'away'; flushCache(s); }
   syncRender();
 };
 
@@ -1014,7 +1040,7 @@ function drawSync() {
       html += `<div class="sync-opts">
         <label><input type="checkbox" id="optAuto" ${sh.auto ? 'checked' : ''}> 바뀌면 자동으로 보내기</label>
         <label><input type="checkbox" id="optGit" ${sh.gitignore ? 'checked' : ''}> .gitignore 규칙 따르기</label>
-        <label><input type="checkbox" id="optMirror" ${sh.mirror ? 'checked' : ''}> 내 쪽에 없는 파일은 상대 쪽에서도 지우기</label>
+        <label><input type="checkbox" id="optMirror" ${sh.mirror ? 'checked' : ''}> 내 쪽에서 지운 파일은 상대 쪽에서도 지우기</label>
       </div>
       <details class="sync-ignore"${Sync.ignoreOpen ? ' open' : ''}><summary>${ignoreSummary(sh.ignore)}</summary>
         <p>한 줄에 규칙 하나씩 적어요. .gitignore와 같은 문법이고, .git/ 과 node_modules/ 는 기본으로 빠져요.</p>
@@ -1132,13 +1158,12 @@ function peerRow(sess) {
     const parts = [];
     if (d.send.length) parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개 · ${fmtSize(d.bytes)} · ${fmtDuration(estimate(sess, d.bytes, d.send.length))}`);
     if (Sync.share.mirror && d.extra.length) parts.push(`지울 파일 ${d.extra.length}개`);
-    st = parts.length ? parts.join(' · ') : `<span class="ok">✓ 같아요 · 파일 ${Sync.local.size.toLocaleString()}개 모두 일치</span>`;
-    if (!Sync.share.mirror && d.extra.length && !d.send.length) st += ` <small>(상대 쪽에만 있는 파일 ${d.extra.length}개)</small>`;
-    // 양쪽 개수와 마지막 비교 시각
-    const at = Math.max(sess.remoteAt || 0, sess.checkedAt || 0);
-    st += `<br><small class="pr-count">내 PC ${Sync.local.size.toLocaleString()}개 · 상대 PC ${sess.remote.size.toLocaleString()}개${at ? ` · ${ago(at)} 확인` : ''}</small>`;
+    st = parts.length ? parts.join(' · ') : '<span class="ok">✓ 보낼 변경 없음</span>';
+    // 내 파일 개수와 마지막 확인 시각 (상대 폴더 상태는 보여 주지 않음)
+    const at = Math.max(Sync.localAt || 0, sess.checkedAt || 0);
+    st += `<br><small class="pr-count">내 PC ${Sync.local.size.toLocaleString()}개${at ? ` · ${ago(at)} 확인` : ''}</small>`;
   }
-  if (sess.state !== 'away') btn = `<button type="button" data-sa="check" data-id="${sess.pid}" ${sess.state === 'ready' && !sess.checking ? '' : 'disabled'} title="내 폴더와 상대 폴더를 지금 다시 비교해요">동기화 확인</button>`
+  if (sess.state !== 'away') btn = `<button type="button" data-sa="check" data-id="${sess.pid}" ${sess.state === 'ready' && !sess.checking ? '' : 'disabled'} title="내 폴더에서 바뀐 파일을 지금 다시 확인해요">동기화 확인</button>`
     + `<button type="button" class="solid" data-sa="push" data-id="${sess.pid}" ${canPush ? '' : 'disabled'}>공유하기</button>`;
   const open = Sync.openList.has(sess.pid);
   const toggle = canPush ? `<button type="button" class="link" data-sa="list" data-id="${sess.pid}">${open ? '변경 목록 접기' : '변경 목록 보기'}</button>` : '';
@@ -1232,7 +1257,7 @@ function changeList(sess) {
   for (const r of rows) cnt[r[1]]++;
   return `<div class="changes"><div class="cl-sum"><span class="add">추가 ${cnt.A}</span><span class="mod">수정 ${cnt.M}</span>${Sync.share.mirror ? `<span class="del">삭제 ${cnt.D}</span>` : ''}</div>${html}${more}</div>`;
 }
-// 보내기 전에 상대 PC의 지금 내용과 비교
+// 보내기 전 미리보기: 상대 PC 파일이 마지막으로 보낸 그대로일 때만 비교 (상대가 고친 내용은 보여 주지 않음)
 async function peek(pid, path) {
   const sess = Sync.sessions.get(pid);
   const p = sess && S.peers.get(sess.peerId);
@@ -1240,9 +1265,10 @@ async function peek(pid, path) {
   if (!p || !e) return;
   const rid = randStr(10);
   const reply = new Promise(res => { Sync.peeks.set(rid, res); setTimeout(() => { if (Sync.peeks.delete(rid)) res(null); }, 10000); });
-  sendCtrl(p, { t: 'sync-peek', sid: Sync.share.id, rid, path }).catch(() => {});
+  sendCtrl(p, { t: 'sync-peek', sid: Sync.share.id, rid, path, base: sess.base && sess.base.get(path) }).catch(() => {});
   const [r, mine] = await Promise.all([reply, e.handle.getFile().then(readTextMaybe).catch(() => null)]);
   if (!r) return toast('상대 PC에서 내용을 받지 못했어요.');
+  if (r.edited) return toast('상대 PC의 파일이 마지막으로 보낸 내용과 달라서 내 변경만 따로 보여 줄 수 없어요.', 5000);
   if (mine == null || (r.exists && r.text == null)) return toast('텍스트 파일이 아니거나 너무 커서 줄 비교를 할 수 없어요.');
   openDiff(path, lineDiff(r.exists ? r.text : '', mine), r.exists ? '보내기 전 미리보기' : '새 파일 미리보기');
 }
@@ -1253,8 +1279,9 @@ async function inPeek(p, m) {
   if (!s || !s.handle || s.peerId !== p.id || !path || isIgnored(s.rules, path, false) || !isTextPath(path)) return reply({ exists: false, text: null, denied: true });
   try {
     const file = await (await fileHandleAt(s.handle, path, false)).getFile();
+    if (m.base && await hashFile(file) !== m.base) return reply({ exists: true, text: null, edited: true });   // 이쪽에서 고친 내용은 보내지 않음
     reply({ exists: true, text: await readTextMaybe(file) });
-  } catch { reply({ exists: false, text: null }); }
+  } catch { reply({ exists: false, text: null, edited: !!m.base }); }
 }
 
 // ---------- 히스토리 ----------
