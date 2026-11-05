@@ -4,7 +4,7 @@
  * 2) 받는 쪽이 받을 위치를 고르면(또는 전에 고른 위치가 있고 권한이 있으면) 자기 폴더 목록과 해시를 한 번 보냅니다.
  *    이후 받는 쪽은 공유 요청·동기화 확인 때만 목록을 보내고, 받는 쪽에서 고친 내용은 알리지 않습니다.
  * 3) 공유하는 쪽은 몇 초마다 폴더를 훑어 "기기별로 마지막에 보낸 해시(기준)"와 비교하고, 내가 고친 파일이 있으면 "공유하기"를 켭니다.
- *    기준이 없는 파일(첫 연결)만 상대 폴더와 직접 비교해서, 같으면 그 해시를 기준으로 삼습니다.
+ *    첫 비교 때는 양쪽에 다 있는 파일의 지금 내 해시를 기준으로 삼고(내용이 달라도 내가 고친 것으로 보지 않음), 상대에게 없는 파일만 보냅니다.
  * 4) 공유하기를 누르면 바뀐 파일만 기다림 없이 연달아 보내고, 받는 쪽은 디스크에 바로 씁니다.
  * 두 PC의 짝은 기기 고유 id(pid)로 기억해서 다음 연결 때 다시 고르지 않아도 됩니다.
  */
@@ -196,7 +196,7 @@ async function stopWith(pid) {
   const p = sess && S.peers.get(sess.peerId);
   if (sess) { cancelPush(sess); markResume(sess, false); }   // 진행 중인 전송을 즉시 멈춤 (남은 파일을 헛되이 보내지 않도록)
   if (p) sendCtrl(p, { t: 'sync-stop', sid: Sync.share.id }).catch(() => {});
-  dropBase(pid);   // 다시 공유하면 상대 폴더와 처음부터 비교
+  dropBase(pid);   // 다시 공유하면 첫 비교부터 새로 시작
   Sync.sessions.delete(pid);
   Sync.share.targets = Sync.share.targets.filter(x => x !== pid);
   await saveShare();
@@ -204,30 +204,41 @@ async function stopWith(pid) {
 }
 // 기준(base): 이 기기에 마지막으로 보낸(또는 처음에 같다고 확인한) 파일의 해시. Map(path -> hash)
 // 내 파일을 기준과 비교하므로, 상대가 자기 폴더에서 고친 내용은 변경으로 잡히지 않음
-const baseKey = pid => `base:${Sync.share.id}:${pid}`;
+const baseKey = pid => `base2:${Sync.share.id}:${pid}`;
+const oldBaseKey = pid => `base:${Sync.share.id}:${pid}`;   // 첫 비교 규칙이 달랐던 이전 버전의 기준
 function loadBase(sess) {
   sess.baseKey = baseKey(sess.pid);
-  return sess.baseLoad || (sess.baseLoad = idb.get('kv', sess.baseKey).then(m => { sess.base = m instanceof Map ? m : new Map(); }));
+  sess.oldBaseKey = oldBaseKey(sess.pid);
+  return sess.baseLoad || (sess.baseLoad = (async () => {
+    const saved = await idb.get('kv', sess.baseKey);
+    if (saved instanceof Map) { sess.base = saved; return; }
+    const old = await idb.get('kv', sess.oldBaseKey);   // 이전 버전 기준에 있던 파일은 내가 고쳤는지 그대로 판단
+    sess.base = old instanceof Map ? old : new Map();
+    sess.baseFirst = true;
+  })());
 }
 function saveBase(sess) {
   clearTimeout(sess.baseTimer);
-  sess.baseTimer = setTimeout(() => idb.set('kv', sess.baseKey, sess.base), 1000);
+  sess.baseTimer = setTimeout(() => { idb.set('kv', sess.baseKey, sess.base); idb.del('kv', sess.oldBaseKey); }, 1000);
 }
 function dropBase(pid) {
   const sess = Sync.sessions.get(pid);
   if (sess) clearTimeout(sess.baseTimer);
   idb.del('kv', baseKey(pid));
+  idb.del('kv', oldBaseKey(pid));
 }
 function diff(sess) {
   if (!Sync.local || !sess.remote || !sess.base) return;
   const base = sess.base;
   const send = [];
   const status = new Map();
-  let bytes = 0, dirty = false;
+  let bytes = 0, dirty = !!sess.baseFirst;
+  const first = sess.baseFirst;   // 첫 비교: 기록이 없는 파일이 상대와 달라도 누가 고쳤는지 모르므로 변경으로 치지 않음
+  sess.baseFirst = false;
   for (const [path, e] of Sync.local) {
     const b = base.get(path), r = sess.remote.get(path);
     if (b === e.hash) continue;   // 내가 고치지 않은 파일 (상대가 고쳤어도 무시)
-    if (r && r[1] === e.hash) { base.set(path, e.hash); dirty = true; continue; }   // 이미 같은 내용
+    if (r && (r[1] === e.hash || (first && b == null))) { base.set(path, e.hash); dirty = true; continue; }   // 이미 같은 내용, 또는 첫 비교
     send.push(path); bytes += e.size; status.set(path, b != null || r ? 'M' : 'A');
   }
   // 지울 대상: 전에 보낸 적이 있는데 내 쪽에서 지운 파일 (상대 쪽에만 있는 파일은 건드리지 않음)
