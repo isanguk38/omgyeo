@@ -111,7 +111,6 @@ async function grantShare() {
 }
 function cancelPush(sess) { sess.cancelled = true; wakeAll(sess); }
 function stopAll() {
-  for (const pid of Sync.share.targets) dropBase(pid);
   for (const sess of Sync.sessions.values()) {
     cancelPush(sess);
     const p = S.peers.get(sess.peerId);
@@ -176,10 +175,7 @@ function offer(p) {
     Sync.sessions.set(pid, sess);
   }
   Object.assign(sess, { peerId: p.id, name: p.name, state: 'offer', remote: null, parts: [], remoteScan: null, busy: false });
-  loadBase(sess).then(() => {   // 상대 목록이 오기 전에 기록을 먼저 읽어 둠
-    if (!Sync.share || Sync.sessions.get(pid) !== sess) return;
-    sendCtrl(p, { t: 'sync-offer', sid: Sync.share.id, name: Sync.share.name, rules: Sync.ruleText }).catch(() => {});
-  });
+  sendCtrl(p, { t: 'sync-offer', sid: Sync.share.id, name: Sync.share.name, rules: Sync.ruleText }).catch(() => {});
   scanLoop();
   syncRender();
 }
@@ -195,70 +191,24 @@ async function stopWith(pid) {
   const p = sess && S.peers.get(sess.peerId);
   if (sess) { cancelPush(sess); markResume(sess, false); }   // 진행 중인 전송을 즉시 멈춤 (남은 파일을 헛되이 보내지 않도록)
   if (p) sendCtrl(p, { t: 'sync-stop', sid: Sync.share.id }).catch(() => {});
-  dropBase(pid);   // 받는 폴더가 달라질 수 있으니 기록을 새로 시작
   Sync.sessions.delete(pid);
   Sync.share.targets = Sync.share.targets.filter(x => x !== pid);
   await saveShare();
   syncRender();
 }
-// 기록(base): 기기별로 양쪽 내용이 마지막으로 같았을 때의 해시. Map(path -> hash)
-// 기록과 내 해시·상대 해시를 비교해서 누가 고쳤는지 구분함
-const baseKey = pid => `base2:${Sync.share.id}:${pid}`;
-const oldBaseKey = pid => `base:${Sync.share.id}:${pid}`;   // 이전 버전에서 저장한 기록도 그대로 씀
-function loadBase(sess) {
-  sess.baseKey = baseKey(sess.pid);
-  sess.oldBaseKey = oldBaseKey(sess.pid);
-  return sess.baseLoad || (sess.baseLoad = (async () => {
-    const saved = await idb.get('kv', sess.baseKey);
-    const old = saved instanceof Map ? null : await idb.get('kv', sess.oldBaseKey);
-    sess.base = saved instanceof Map ? saved : old instanceof Map ? old : new Map();
-  })());
-}
-function saveBase(sess) {
-  clearTimeout(sess.baseTimer);
-  sess.baseTimer = setTimeout(() => { idb.set('kv', sess.baseKey, sess.base); idb.del('kv', sess.oldBaseKey); }, 1000);
-}
-function dropBase(pid) {
-  const sess = Sync.sessions.get(pid);
-  if (sess) clearTimeout(sess.baseTimer);
-  idb.del('kv', baseKey(pid));
-  idb.del('kv', oldBaseKey(pid));
-}
-// 다른 파일을 누가 바꿨는지. me: 내가, them: 상대가, both: 양쪽 다, new: 기록 없이 내 쪽에만 있음, unknown: 기록이 없어 알 수 없음
-function whoChanged(base, mine, theirs) {
-  if (base == null) return theirs == null ? 'new' : 'unknown';
-  const iChanged = mine !== base, theyChanged = theirs !== base;
-  return iChanged && theyChanged ? 'both' : theyChanged ? 'them' : 'me';
-}
 function diff(sess) {
-  if (!Sync.local || !sess.remote || !sess.base) return;
-  const base = sess.base;
+  if (!Sync.local || !sess.remote) return;
   const send = [];
   const status = new Map();
-  const who = new Map();
-  let bytes = 0, dirty = false;
+  let bytes = 0;
   for (const [path, e] of Sync.local) {
     const r = sess.remote.get(path);
-    if (r && r[1] === e.hash) {
-      if (base.get(path) !== e.hash) { base.set(path, e.hash); dirty = true; }
-      continue;
-    }
-    send.push(path); bytes += e.size; status.set(path, r ? 'M' : 'A');
-    who.set(path, whoChanged(base.get(path), e.hash, r && r[1]));
+    if (!r || r[1] !== e.hash) { send.push(path); bytes += e.size; status.set(path, r ? 'M' : 'A'); }
   }
   const extra = [];
-  for (const [path, r] of sess.remote) {
-    if (Sync.local.has(path) || scanSkipped(Sync.local, path)) continue;   // 읽지 못한 파일은 지울 대상으로 보지 않음
-    extra.push(path);
-    const b = base.get(path);
-    who.set(path, b == null ? 'them' : r[1] === b ? 'me' : 'both');
-  }
-  for (const path of base.keys()) {   // 양쪽에서 다 없어진 파일은 기록에서도 정리
-    if (!Sync.local.has(path) && !sess.remote.has(path) && !scanSkipped(Sync.local, path)) { base.delete(path); dirty = true; }
-  }
-  if (dirty) saveBase(sess);
+  for (const path of sess.remote.keys()) if (!Sync.local.has(path) && !scanSkipped(Sync.local, path)) extra.push(path);   // 읽지 못한 파일은 지울 대상으로 보지 않음
   send.sort();
-  sess.diff = { send, bytes, extra, status, who };
+  sess.diff = { send, bytes, extra, status };
 }
 const hasWork = sess => sess.diff && (sess.diff.send.length || (Sync.share.mirror && sess.diff.extra.length));
 // 동기화 확인: 내 폴더와 상대 폴더를 지금 다시 훑어서 비교
@@ -493,7 +443,6 @@ function onAckItem(sess, it, ok) {
   sess.lastAck = Date.now();
   if (sess.prog) sess.prog.lastMove = Date.now();
   if (ok && sess.remote) sess.remote.set(it.path, [it.size, it.hash]);
-  if (ok && sess.base) { sess.base.set(it.path, it.hash); saveBase(sess); }
   if (ok && sess.prog) {
     sess.prog.files.push([it.path, it.st || sess.prog.status.get(it.path) || 'M', it.size, it.adds ?? null, it.dels ?? null]);
     if (it.diff) sess.prog.diffs[it.path] = it.diff;
@@ -955,7 +904,6 @@ Sync.onCtrl = async (p, m) => {
     case 'sync-err': {
       if (!mine) return;
       if (m.t === 'sync-ack' && sess.remote) sess.remote.set(m.path, [m.size, m.hash]);
-      if (m.t === 'sync-ack' && sess.base) { sess.base.set(m.path, m.hash); saveBase(sess); }
       if (m.t === 'sync-ack' && sess.prog) {
         sess.prog.files.push([m.path, m.st || sess.prog.status.get(m.path) || 'M', m.size, m.adds ?? null, m.dels ?? null]);
         if (m.diff) sess.prog.diffs[m.path] = m.diff;
@@ -970,8 +918,7 @@ Sync.onCtrl = async (p, m) => {
     }
     case 'sync-deleted':
       if (mine && sess.remote) {
-        for (const path of m.paths || []) { sess.remote.delete(path); if (sess.base) sess.base.delete(path); if (sess.prog) sess.prog.files.push([path, 'D', 0, null, null]); }
-        if (sess.base) saveBase(sess);
+        for (const path of m.paths || []) { sess.remote.delete(path); if (sess.prog) sess.prog.files.push([path, 'D', 0, null, null]); }
         diff(sess); syncRender();
       }
       return;
@@ -1183,10 +1130,7 @@ function peerRow(sess) {
     : `${esc(Sync.scanMsg)} 잠시 뒤 다시 확인해요.`;   // 훑다가 실패하면 계속 도는 표시 대신 이유를 보여 줌
   else if (sess.state === 'ready' && d) {
     const parts = [];
-    if (d.send.length) {
-      const theirs = d.send.filter(path => ['them', 'both'].includes(d.who.get(path))).length;
-      parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개${theirs ? ` (상대가 바꾼 파일 ${theirs.toLocaleString()}개 포함)` : ''} · ${fmtSize(d.bytes)} · ${fmtDuration(estimate(sess, d.bytes, d.send.length))}`);
-    }
+    if (d.send.length) parts.push(`보낼 변경 ${d.send.length.toLocaleString()}개 · ${fmtSize(d.bytes)} · ${fmtDuration(estimate(sess, d.bytes, d.send.length))}`);
     if (Sync.share.mirror && d.extra.length) parts.push(`지울 파일 ${d.extra.length}개`);
     st = parts.length ? parts.join(' · ') : `<span class="ok">✓ 같아요 · 파일 ${Sync.local.size.toLocaleString()}개 모두 일치</span>`;
     if (!Sync.share.mirror && d.extra.length && !d.send.length) st += ` <small>(상대 쪽에만 있는 파일 ${d.extra.length}개)</small>`;
@@ -1271,31 +1215,22 @@ function reoffer() {
 
 // ---------- 변경 목록 ----------
 const ST_LABEL = { A: ['add', '+', '추가'], M: ['mod', '~', '수정'], D: ['del', '−', '삭제'] };
-const WHO_LABEL = {
-  M: { me: '내가 수정', them: '상대가 수정', both: '양쪽 다 수정', unknown: '누가 고쳤는지 모름' },
-  A: { me: '내가 수정', them: '상대가 삭제', both: '내가 수정 · 상대가 삭제', new: '내 쪽에만 있음' },
-  D: { me: '내가 삭제', them: '상대 쪽에만 있음', both: '내가 삭제 · 상대가 수정' },
-};
 function changeList(sess) {
   const d = sess.diff;
-  const rows = d.send.map(path => [path, d.status.get(path) || 'M', Sync.local.get(path), d.who.get(path)]);
-  if (Sync.share.mirror) for (const path of d.extra) rows.push([path, 'D', null, d.who.get(path)]);
+  const rows = d.send.map(path => [path, d.status.get(path) || 'M', Sync.local.get(path)]);
+  if (Sync.share.mirror) for (const path of d.extra) rows.push([path, 'D', null]);
   const LIMIT = 300;
-  const html = rows.slice(0, LIMIT).map(([path, st, e, who]) => {
+  const html = rows.slice(0, LIMIT).map(([path, st, e]) => {
     const [cls, mark, label] = ST_LABEL[st];
     const canPeek = st !== 'D' && isTextPath(path) && e && e.size <= TEXT_MAX;
     return `<div class="cl-row ${cls}"><span class="cl-mark" title="${label}">${mark}</span><span class="cl-path">${esc(path)}</span>
-      <span class="cl-who who-${who}">${WHO_LABEL[st][who] || ''}</span>
       <span class="cl-size">${e ? fmtSize(e.size) : ''}</span>
       ${canPeek ? `<button type="button" class="link" data-sa="peek" data-id="${sess.pid}" data-path="${esc(path)}">바뀐 줄</button>` : '<span></span>'}</div>`;
   }).join('');
   const more = rows.length > LIMIT ? `<div class="cl-more">외 ${rows.length - LIMIT}개</div>` : '';
   const cnt = { A: 0, M: 0, D: 0 };
   for (const r of rows) cnt[r[1]]++;
-  const whoCnt = { mine: 0, theirs: 0, unknown: 0 };
-  for (const r of rows) whoCnt[r[3] === 'me' || r[3] === 'new' ? 'mine' : r[3] === 'unknown' ? 'unknown' : 'theirs']++;
-  const warn = whoCnt.theirs ? `<div class="cl-warn">상대가 바꾼 파일이 있어요. 공유하기를 누르면 그 파일도 내 쪽 내용으로 맞춰져서 상대가 바꾼 내용이 사라져요.</div>` : '';
-  return `<div class="changes"><div class="cl-sum"><span class="add">추가 ${cnt.A}</span><span class="mod">수정 ${cnt.M}</span>${Sync.share.mirror ? `<span class="del">삭제 ${cnt.D}</span>` : ''}<span class="cl-sum-who">내 변경 ${whoCnt.mine} · 상대 변경 ${whoCnt.theirs}${whoCnt.unknown ? ` · 모름 ${whoCnt.unknown}` : ''}</span></div>${warn}${html}${more}</div>`;
+  return `<div class="changes"><div class="cl-sum"><span class="add">추가 ${cnt.A}</span><span class="mod">수정 ${cnt.M}</span>${Sync.share.mirror ? `<span class="del">삭제 ${cnt.D}</span>` : ''}</div>${html}${more}</div>`;
 }
 // 보내기 전에 상대 PC의 지금 내용과 비교
 async function peek(pid, path) {
@@ -1309,9 +1244,7 @@ async function peek(pid, path) {
   const [r, mine] = await Promise.all([reply, e.handle.getFile().then(readTextMaybe).catch(() => null)]);
   if (!r) return toast('상대 PC에서 내용을 받지 못했어요.');
   if (mine == null || (r.exists && r.text == null)) return toast('텍스트 파일이 아니거나 너무 커서 줄 비교를 할 수 없어요.');
-  const d = lineDiff(r.exists ? r.text : '', mine);
-  if (r.exists && !d.adds && !d.dels) d.note = '줄 내용과 줄바꿈은 같아요. 눈에 보이지 않는 차이(BOM·인코딩)가 있거나, 그사이 두 파일이 같아졌을 수 있어요.';
-  openDiff(path, d, r.exists ? '보내기 전 미리보기' : '새 파일 미리보기');
+  openDiff(path, lineDiff(r.exists ? r.text : '', mine), r.exists ? '보내기 전 미리보기' : '새 파일 미리보기');
 }
 async function inPeek(p, m) {
   const s = Sync.inbound.get(m.sid);
@@ -1394,18 +1327,12 @@ if (FS_OK) {
 // ---------- 바뀐 줄 보기 ----------
 function openDiff(path, d, label) {
   $('#diffPath').textContent = path;
+  $('#diffMeta').innerHTML = `${esc(label || '')} · <span class="add">+${d.adds}</span> <span class="del">−${d.dels}</span>${d.approx ? ' · 파일이 커서 바뀐 구간을 통째로 표시' : ''}${d.truncated ? ' · 길어서 일부만 표시' : ''}`;
   const lines = (d.hunks || '').split('\n').slice(0, 6000);
-  // 바뀐 줄 중에 CRLF가 있으면 줄바꿈 방식을 줄마다 표시 (안 보이는 차이를 알 수 있게)
-  const changed = lines.filter(l => l[0] === '+' || l[0] === '-');
-  const showEol = changed.some(l => l.endsWith('\r'));
-  const body = sign => changed.filter(l => l[0] === sign).map(l => l.slice(1).replace(/\r$/, '')).sort().join('\n');
-  const eolOnly = showEol && body('+') === body('-');
-  $('#diffMeta').innerHTML = `${esc(label || '')} · <span class="add">+${d.adds}</span> <span class="del">−${d.dels}</span>${eolOnly ? ' · 줄바꿈 방식만 바뀌었어요' : ''}${d.approx ? ' · 파일이 커서 바뀐 구간을 통째로 표시' : ''}${d.truncated ? ' · 길어서 일부만 표시' : ''}`;
   $('#diffBody').innerHTML = lines.length && d.hunks ? lines.map(l => {
     const c = l.startsWith('@@') ? 'hk' : l[0] === '+' ? 'add' : l[0] === '-' ? 'del' : 'ctx';
-    const eol = showEol && (c === 'add' || c === 'del') ? `<span class="dl-eol">${l.endsWith('\r') ? 'CRLF' : 'LF'}</span>` : '';
-    return `<div class="dl ${c}">${esc(l.replace(/\r$/, '')) || ' '}${eol}</div>`;
-  }).join('') : `<div class="dl ctx">${esc(d.note || '내용이 같아요.')}</div>`;
+    return `<div class="dl ${c}">${esc(l) || ' '}</div>`;
+  }).join('') : '<div class="dl ctx">내용이 같아요.</div>';
   $('#diffDlg').showModal();
 }
 if (FS_OK) $('#diffClose').onclick = () => $('#diffDlg').close();
