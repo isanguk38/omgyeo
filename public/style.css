@@ -275,6 +275,7 @@ dialog.wide[open]{display:flex}
 .dl{white-space:pre;padding:0 16px;min-width:max-content}
 .dl.add{background:var(--add-bg);color:var(--ink)}
 .dl.del{background:var(--del-bg);color:var(--ink)}
+.dl-eol{margin-left:8px;padding:0 4px;border:1px solid var(--line);border-radius:4px;font-size:10px;color:var(--muted)}
 .dl.hk{color:var(--muted);background:var(--sunk);margin-top:6px;padding-block:2px}
 .dl.ctx{color:var(--muted)}
 

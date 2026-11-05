@@ -1310,14 +1310,8 @@ async function peek(pid, path) {
   if (!r) return toast('상대 PC에서 내용을 받지 못했어요.');
   if (mine == null || (r.exists && r.text == null)) return toast('텍스트 파일이 아니거나 너무 커서 줄 비교를 할 수 없어요.');
   const d = lineDiff(r.exists ? r.text : '', mine);
-  if (r.exists && !d.adds && !d.dels) d.note = sameLinesNote(mine, r.text);
+  if (r.exists && !d.adds && !d.dels) d.note = '줄 내용과 줄바꿈은 같아요. 눈에 보이지 않는 차이(BOM·인코딩)가 있거나, 그사이 두 파일이 같아졌을 수 있어요.';
   openDiff(path, d, r.exists ? '보내기 전 미리보기' : '새 파일 미리보기');
-}
-// 줄 내용이 모두 같은데 파일이 다르다고 나온 이유 (줄 비교는 줄바꿈 방식을 구분하지 않음)
-function sameLinesNote(mine, theirs) {
-  const eol = t => (t.includes('\r\n') ? 'CRLF' : 'LF');
-  if (mine !== theirs) return `줄 내용은 같고 줄바꿈 방식만 달라요 (내 파일 ${eol(mine)} · 상대 파일 ${eol(theirs)})`;
-  return '줄 내용과 줄바꿈은 같아요. 눈에 보이지 않는 차이(BOM·인코딩)가 있거나, 그사이 두 파일이 같아졌을 수 있어요.';
 }
 async function inPeek(p, m) {
   const s = Sync.inbound.get(m.sid);
@@ -1400,11 +1394,17 @@ if (FS_OK) {
 // ---------- 바뀐 줄 보기 ----------
 function openDiff(path, d, label) {
   $('#diffPath').textContent = path;
-  $('#diffMeta').innerHTML = `${esc(label || '')} · <span class="add">+${d.adds}</span> <span class="del">−${d.dels}</span>${d.approx ? ' · 파일이 커서 바뀐 구간을 통째로 표시' : ''}${d.truncated ? ' · 길어서 일부만 표시' : ''}`;
   const lines = (d.hunks || '').split('\n').slice(0, 6000);
+  // 바뀐 줄 중에 CRLF가 있으면 줄바꿈 방식을 줄마다 표시 (안 보이는 차이를 알 수 있게)
+  const changed = lines.filter(l => l[0] === '+' || l[0] === '-');
+  const showEol = changed.some(l => l.endsWith('\r'));
+  const body = sign => changed.filter(l => l[0] === sign).map(l => l.slice(1).replace(/\r$/, '')).sort().join('\n');
+  const eolOnly = showEol && body('+') === body('-');
+  $('#diffMeta').innerHTML = `${esc(label || '')} · <span class="add">+${d.adds}</span> <span class="del">−${d.dels}</span>${eolOnly ? ' · 줄바꿈 방식만 바뀌었어요' : ''}${d.approx ? ' · 파일이 커서 바뀐 구간을 통째로 표시' : ''}${d.truncated ? ' · 길어서 일부만 표시' : ''}`;
   $('#diffBody').innerHTML = lines.length && d.hunks ? lines.map(l => {
     const c = l.startsWith('@@') ? 'hk' : l[0] === '+' ? 'add' : l[0] === '-' ? 'del' : 'ctx';
-    return `<div class="dl ${c}">${esc(l) || ' '}</div>`;
+    const eol = showEol && (c === 'add' || c === 'del') ? `<span class="dl-eol">${l.endsWith('\r') ? 'CRLF' : 'LF'}</span>` : '';
+    return `<div class="dl ${c}">${esc(l.replace(/\r$/, '')) || ' '}${eol}</div>`;
   }).join('') : `<div class="dl ctx">${esc(d.note || '내용이 같아요.')}</div>`;
   $('#diffDlg').showModal();
 }

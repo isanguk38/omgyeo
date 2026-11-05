@@ -277,25 +277,31 @@ async function readTextMaybe(file) {
   return new TextDecoder().decode(buf);
 }
 // 결과: { hunks: "@@ -1,3 +1,4 @@\n 같은 줄\n-지운 줄\n+추가한 줄", adds, dels, approx, truncated }
+// 줄 끝의 \r을 남겨 두므로, 줄바꿈 방식(CRLF/LF)만 바뀐 줄도 지운 줄·추가한 줄로 나옴
 function lineDiff(oldText, newText, maxBytes = 64 * 1024) {
-  const A = oldText ? oldText.split(/\r?\n/) : [];
-  const B = newText ? newText.split(/\r?\n/) : [];
+  const A = oldText ? oldText.split('\n') : [];
+  const B = newText ? newText.split('\n') : [];
+  // 줄 맞추기는 줄바꿈을 뺀 내용으로 해서, 줄바꿈만 바뀐 줄이 제자리에서 지운 줄·추가한 줄로 짝지어 나오게 함
+  const noEol = l => (l.endsWith('\r') ? l.slice(0, -1) : l);
+  const NA = A.map(noEol), NB = B.map(noEol);
+  const match = (x, y) => (x === y ? [[' ', x]] : [['-', x], ['+', y]]);
   let pre = 0;
-  while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+  while (pre < A.length && pre < B.length && NA[pre] === NB[pre]) pre++;
   let suf = 0;
-  while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++;
+  while (suf < A.length - pre && suf < B.length - pre && NA[A.length - 1 - suf] === NB[B.length - 1 - suf]) suf++;
   const a = A.slice(pre, A.length - suf), b = B.slice(pre, B.length - suf);
+  const na = NA.slice(pre, A.length - suf), nb = NB.slice(pre, B.length - suf);
   const n = a.length, m = b.length;
   const mid = [];
   let approx = false;
   if (n * m <= 4e6) {   // 최장 공통 부분(LCS)으로 정확히 비교
     const W = m + 1, L = new Uint32Array((n + 1) * W);
     for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
-      L[i * W + j] = a[i] === b[j] ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
+      L[i * W + j] = na[i] === nb[j] ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
     }
     let i = 0, j = 0;
     while (i < n && j < m) {
-      if (a[i] === b[j]) { mid.push([' ', a[i]]); i++; j++; }
+      if (na[i] === nb[j]) { mid.push(...match(a[i], b[j])); i++; j++; }
       else if (L[(i + 1) * W + j] >= L[i * W + j + 1]) mid.push(['-', a[i++]]);
       else mid.push(['+', b[j++]]);
     }
@@ -306,7 +312,10 @@ function lineDiff(oldText, newText, maxBytes = 64 * 1024) {
     for (const x of a) mid.push(['-', x]);
     for (const x of b) mid.push(['+', x]);
   }
-  const ops = [...A.slice(0, pre).map(x => [' ', x]), ...mid, ...A.slice(A.length - suf).map(x => [' ', x])];
+  const ops = [];
+  for (let i = 0; i < pre; i++) ops.push(...match(A[i], B[i]));
+  ops.push(...mid);
+  for (let i = suf; i > 0; i--) ops.push(...match(A[A.length - i], B[B.length - i]));
   let adds = 0, dels = 0;
   for (const [t] of ops) { if (t === '+') adds++; else if (t === '-') dels++; }
   // 바뀐 곳 앞뒤 3줄씩 묶어서 덩어리(hunk)로
